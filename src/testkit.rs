@@ -212,7 +212,35 @@ impl Harness {
 
         self.state.paint();
         let (w, h) = self.state.logical_size();
+        let fb = std::mem::take(&mut self.state.fb);
+        let path = self.save(label, w, h, &fb);
+        self.state.fb = fb;
+        path
+    }
 
+    /// Render the *physical* frame — the byte-for-byte buffer the GUI would
+    /// present to the window surface, including the Retina upscale +
+    /// device-resolution text overdraw when `scale > 1` — and write it as the
+    /// next sequential PNG. This is how the macOS/HiDPI presentation path is
+    /// exercised on a Linux dev box: `screenshot()` shows the logical layer,
+    /// this shows what actually reaches the glass.
+    pub fn screenshot_physical(&mut self, label: &str) -> PathBuf {
+        // Reflow injected terminals, same as `screenshot`.
+        let (lw, lh) = self.state.logical_size();
+        let size = self.state.grid_size(lw, lh);
+        for s in self.state.sessions.values_mut() {
+            s.tab.size = size;
+            s.tab.term.lock().resize(size);
+        }
+
+        let (pw, ph) = self.state.phys;
+        let mut buf = vec![0u32; pw * ph];
+        self.state.compose_physical(&mut buf);
+        self.save(label, pw, ph, &buf)
+    }
+
+    /// Write `fb` (`w`×`h`) as the next sequential, drop-shadow-framed PNG.
+    fn save(&mut self, label: &str, w: usize, h: usize, fb: &[u32]) -> PathBuf {
         self.seq += 1;
         let safe: String = label
             .chars()
@@ -221,7 +249,7 @@ impl Harness {
         let path = self.dir.join(format!("{:03}-{safe}.png", self.seq));
         // Frame the window in a padded canvas with a soft drop shadow, the way
         // macOS window screenshots look, instead of a bare edge-to-edge crop.
-        let (cw, ch, canvas) = compose_screenshot(w, h, &self.state.fb);
+        let (cw, ch, canvas) = compose_screenshot(w, h, fb);
         write_png(&path, cw, ch, &canvas).expect("write png");
         println!("Screenshot taken: {}", path.display());
         path

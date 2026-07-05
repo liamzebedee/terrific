@@ -76,6 +76,38 @@ fn ui_walkthrough() {
     h.screenshot("sidebar-hidden");
 }
 
+/// The frame a Mac actually *presents*: the physical compose, i.e. the
+/// nearest-neighbour shape upscale plus the crisp device-resolution text
+/// overdraw that only runs when `scale > 1`. On a 1× Linux dev box this path
+/// otherwise never executes — this is the on-Linux stand-in for launching the
+/// app on a Retina display. Open the printed PNGs to review.
+#[test]
+fn retina_physical_frames() {
+    // 2.0 = a real Retina display; the window is 2200×1440 physical px.
+    let mut h = Harness::with_window(WORKSPACE, 2200, 1440, 2.0);
+    eprintln!("screenshot dir: {}", h.dir().display());
+    h.select("Diabetes/Sugar tracker")
+        .feed("Sugar tracker", SAMPLE);
+    h.screenshot_physical("retina2x-terminal");
+    h.inspector(true);
+    h.screenshot_physical("retina2x-inspector");
+    h.inspector(false).sidebar(false);
+    h.screenshot_physical("retina2x-no-sidebar");
+
+    // Fractional DPI (e.g. a scaled external display): the hardest case for
+    // the upscale's edge math.
+    let mut f = Harness::with_window(WORKSPACE, 1650, 1080, 1.5);
+    f.select("Diabetes/Sugar tracker")
+        .feed("Sugar tracker", SAMPLE);
+    f.screenshot_physical("retina1-5x-terminal");
+
+    // 1×: physical == logical; the compose must degrade to a straight copy.
+    let mut o = Harness::with_window(WORKSPACE, 1100, 720, 1.0);
+    o.select("Diabetes/Sugar tracker")
+        .feed("Sugar tracker", SAMPLE);
+    o.screenshot_physical("plain1x-terminal");
+}
+
 /// The macOS fix: the UI is laid out in logical pixels, so a 2× Retina
 /// display must produce a pixel-identical frame to a 1× display of the same
 /// logical size — only the final upscale differs.

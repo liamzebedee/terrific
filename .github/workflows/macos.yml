@@ -1,0 +1,51 @@
+# Real-Mac verification from a Linux dev box. Runs the build + full test suite
+# (including the headless Retina-compose screenshots from `testkit`) on a GitHub
+# macOS runner, then launches the actual app in the runner's GUI session and
+# captures the live screen. Every PNG is uploaded as a workflow artifact —
+# download it from the run page to see exactly what termset looks like on macOS.
+name: macos
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests (headless screenshot harness)
+        # `testkit` writes its PNGs under `std::env::temp_dir()`, which honours
+        # $TMPDIR — point it into the workspace so they upload as artifacts.
+        run: |
+          mkdir -p shots
+          TMPDIR="$PWD/shots" cargo test -- --nocapture
+      - name: Launch the real app and capture the screen
+        # Best-effort: exercises the real winit/softbuffer path (window, Retina
+        # scale, present). CI runner GUI sessions are not guaranteed to allow
+        # window creation or screen capture, so a failure here is a warning,
+        # not a red build — the artifact just won't include live-screen.png.
+        continue-on-error: true
+        run: |
+          cargo build --bin terms
+          cat > ci-layout.yml <<'EOF'
+          groups:
+            - name: CI
+              sessions:
+                - name: shell
+                  dir: ~
+                  command: ""
+          EOF
+          ./target/debug/terms ci-layout.yml &
+          APP=$!
+          sleep 10
+          screencapture -x shots/live-screen.png || true
+          kill $APP || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-screenshots
+          path: shots/
+          if-no-files-found: warn

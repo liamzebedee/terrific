@@ -1478,6 +1478,52 @@ impl State {
         );
     }
 
+    /// Compose the complete frame at *physical* resolution into `buf`
+    /// (`phys.0 × phys.1` pixels): paint the logical frame — capturing chrome
+    /// text instead of drawing it when a real upscale is needed — then
+    /// nearest-neighbour upscale the shape layer and overdraw all text crisply
+    /// at device resolution. This is byte-for-byte the frame the GUI presents;
+    /// `App::redraw` blits it to the window surface and the headless harness
+    /// (`testkit`) screenshots it directly, so the Retina path is testable on
+    /// any machine.
+    fn compose_physical(&mut self, buf: &mut [u32]) {
+        let (pw, ph) = self.phys;
+        debug_assert_eq!(buf.len(), pw * ph);
+        let (lw, lh) = self.logical_size();
+        let scaled = (lw, lh) != (pw, ph);
+        // Capture chrome text instead of drawing it into the logical frame,
+        // so it doesn't get upscaled-and-chunky — it's replayed crisply below.
+        self.renderer.text_log = if scaled { Some(Vec::new()) } else { None };
+        self.paint();
+        if !scaled {
+            // Non-HiDPI: the logical frame already is the physical frame.
+            buf.copy_from_slice(&self.fb);
+            return;
+        }
+        // Nearest-neighbour upscale of the shape layer (text was captured, not
+        // drawn, so this doesn't blur any glyphs). Sample by the constant device
+        // `scale`, not the `pw/lw` stretch ratio: the stretch ratio drifts a
+        // fraction of a percent each resize step under fractional DPI, which
+        // jitters every chrome edge (the sidebar's right border most visibly).
+        // `logical_size` rounds up, so `px/scale < lw` always holds — full
+        // coverage, no clamp-induced edge artefact.
+        let s = self.scale.max(1.0);
+        for py in 0..ph {
+            let ly = ((py as f64 / s) as usize).min(lh - 1);
+            let (srow, drow) = (ly * lw, py * pw);
+            for px in 0..pw {
+                let lx = ((px as f64 / s) as usize).min(lw - 1);
+                buf[drow + px] = self.fb[srow + lx];
+            }
+        }
+        // Now render text at true device resolution over the upscaled shapes:
+        // the terminal grid first, then the captured chrome strings.
+        self.overdraw_terminal_physical(buf, pw, ph);
+        if let Some(cmds) = self.renderer.text_log.take() {
+            render_text_cmds(buf, pw, ph, &mut self.renderer, cmds, s, s);
+        }
+    }
+
     /// Which leaf's terminal to show: the selection if it is a leaf with a
     /// session, otherwise the first session-bearing leaf under the selection.
     fn shown(&self) -> Option<NodeId> {
@@ -1678,7 +1724,7 @@ impl State {
         if self.mods.control_key() && !self.link_cells.is_empty() {
             return CursorIcon::Pointer;
         }
-        resize_dir(pw, ph, self.mouse.0, self.mouse.1)
+        resize_dir(pw, ph, self.inspector, self.mouse.0, self.mouse.1)
             .map(resize_cursor)
             .unwrap_or(CursorIcon::Default)
     }
@@ -2334,22 +2380,18 @@ impl App {
     /// top, so nothing looks doubled or soft. The harness skips this and reads
     /// `State::fb` directly. Non-HiDPI is a straight copy.
     fn redraw(&mut self) {
-        let scaled = if let Some(st) = self.state.as_mut() {
-            st.sync_metrics();
-            let (lw, lh) = st.logical_size();
-            let scaled = (lw, lh) != st.phys;
-            // Capture chrome text instead of drawing it into the logical frame,
-            // so it doesn't get upscaled-and-chunky — we replay it crisply below.
-            st.renderer.text_log = if scaled { Some(Vec::new()) } else { None };
-            st.paint();
-            scaled
-        } else {
-            return;
-        };
         let App { state, surface, revealed, .. } = self;
         let (Some(st), Some(surface)) = (state.as_mut(), surface.as_mut()) else {
             return;
         };
+        st.sync_metrics();
+        let (pw, ph) = st.phys;
+        let (Some(w), Some(h)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) else {
+            return;
+        };
+        surface.resize(w, h).unwrap();
+        let mut buf = surface.buffer_mut().unwrap();
+        st.compose_physical(&mut buf[..]);
         // Map the window the first time a frame is about to reach the screen —
         // *before* `present()`, not after. An X11 window has no backing store,
         // so presenting while it's still hidden is discarded, and mapping an
@@ -2357,52 +2399,12 @@ impl App {
         // presenting in the same synchronous block, makes the server process
         // Map→PutImage in order so the compositor's first composite already
         // holds our pixels — no flash, no see-through frame.
-        let reveal = |st: &State, revealed: &mut bool| {
-            if !*revealed {
-                if let Some(w) = &st.window {
-                    w.set_visible(true);
-                }
-                *revealed = true;
+        if !*revealed {
+            if let Some(w) = &st.window {
+                w.set_visible(true);
             }
-        };
-        let (pw, ph) = st.phys;
-        let (Some(w), Some(h)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) else {
-            return;
-        };
-        let (lw, lh) = st.logical_size();
-        surface.resize(w, h).unwrap();
-        let mut buf = surface.buffer_mut().unwrap();
-        if !scaled {
-            // Non-HiDPI: the logical frame already is the physical frame.
-            buf.copy_from_slice(&st.fb);
-            reveal(st, revealed);
-            buf.present().unwrap();
-            return;
+            *revealed = true;
         }
-        // Nearest-neighbour upscale of the shape layer (text was captured, not
-        // drawn, so this doesn't blur any glyphs). Sample by the constant device
-        // `scale`, not the `pw/lw` stretch ratio: the stretch ratio drifts a
-        // fraction of a percent each resize step under fractional DPI, which
-        // jitters every chrome edge (the sidebar's right border most visibly).
-        // `logical_size` rounds up, so `px/scale < lw` always holds — full
-        // coverage, no clamp-induced edge artefact.
-        let s = st.scale.max(1.0);
-        for py in 0..ph {
-            let ly = ((py as f64 / s) as usize).min(lh - 1);
-            let (srow, drow) = (ly * lw, py * pw);
-            for px in 0..pw {
-                let lx = ((px as f64 / s) as usize).min(lw - 1);
-                buf[drow + px] = st.fb[srow + lx];
-            }
-        }
-        // Now render text at true device resolution over the upscaled shapes:
-        // the terminal grid first, then the captured chrome strings.
-        st.overdraw_terminal_physical(&mut buf[..], pw, ph);
-        let (sx, sy) = (s, s);
-        if let Some(cmds) = st.renderer.text_log.take() {
-            render_text_cmds(&mut buf[..], pw, ph, &mut st.renderer, cmds, sx, sy);
-        }
-        reveal(st, revealed);
         buf.present().unwrap();
     }
 
@@ -2917,7 +2919,7 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         // 4. Borderless-window resize grips.
-                        if let Some(dir) = resize_dir(pw, ph, mx, my) {
+                        if let Some(dir) = resize_dir(pw, ph, self.state.as_ref().unwrap().inspector, mx, my) {
                             if let Some(w) = &self.state.as_ref().unwrap().window {
                                 let _ = w.drag_resize_window(dir);
                             }

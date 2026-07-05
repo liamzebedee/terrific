@@ -997,18 +997,24 @@ pub(crate) fn usecwd_btn(pw: usize, cell_h: usize) -> Rect {
 /// larger `CORNER` square so the diagonal grips are easy to hit. The **top has
 /// no resize at all** — it's the title bar (drag + window controls), so there's
 /// no North / NorthWest / NorthEast grip to fight dragging.
-pub(crate) fn resize_dir(pw: usize, ph: usize, x: f64, y: f64) -> Option<ResizeDirection> {
+///
+/// The scrollbar's gutter lives on the window's right edge, so its thumb would
+/// otherwise be shadowed by the thin `East` grip and never clickable. Over the
+/// bar's track we suppress the `East` grip and let the scrollbar take the click;
+/// the bottom corners still resize, so the diagonal handles are unaffected.
+pub(crate) fn resize_dir(pw: usize, ph: usize, inspector: bool, x: f64, y: f64) -> Option<ResizeDirection> {
     let (w, h) = (pw as f64, ph as f64);
     let (l, r, b) = (x < EDGE, x >= w - EDGE, y >= h - EDGE);
     // Enlarged squares at the two bottom corners only.
     let (cl, cr) = (x < CORNER, x >= w - CORNER);
     let cb = y >= h - CORNER;
+    let on_sbar = hit(scrollbar_rect(pw, ph, inspector), x, y);
     Some(match () {
         _ if cb && cl => ResizeDirection::SouthWest,
         _ if cb && cr => ResizeDirection::SouthEast,
         _ if b => ResizeDirection::South,
         _ if l => ResizeDirection::West,
-        _ if r => ResizeDirection::East,
+        _ if r && !on_sbar => ResizeDirection::East,
         _ => return None,
     })
 }
