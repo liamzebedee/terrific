@@ -162,7 +162,7 @@ impl Harness {
             Session {
                 tab: Tab {
                     term,
-                    pty_tx: None,
+                    io: crate::Io::Null,
                     size,
                     title,
                 },
@@ -170,6 +170,42 @@ impl Harness {
             },
         );
         self
+    }
+
+    /// Point the virtual mouse at the first on-screen occurrence of `needle`
+    /// in the shown terminal and recompute the hover-link highlight, returning
+    /// the link's open target (`None` = nothing clickable there). Drives the
+    /// same `refresh_link_hover`/`link_under_cursor` path a real mouse move
+    /// does — including the sidebar/header offset math — so link detection is
+    /// testable end to end without a window. Panics if `needle` isn't visible.
+    pub fn hover_text(&mut self, needle: &str) -> Option<String> {
+        let node = self.state.shown().expect("a session is shown");
+        // Locate the needle in the viewport (visible rows as plain text).
+        let (row, col) = {
+            let term = self.state.sessions[&node].tab.term.lock();
+            let mut rows: Vec<String> = Vec::new();
+            for cell in term.grid().display_iter() {
+                if cell.point.column.0 == 0 {
+                    rows.push(String::new());
+                }
+                rows.last_mut().unwrap().push(cell.c);
+            }
+            rows.iter()
+                .enumerate()
+                .find_map(|(r, line)| {
+                    line.find(needle)
+                        .map(|byte| (r, line[..byte].chars().count()))
+                })
+                .unwrap_or_else(|| panic!("{needle:?} not visible on the shown terminal"))
+        };
+        let cw = self.state.renderer.cell_w as f64;
+        let ch = self.state.renderer.cell_h as f64;
+        self.state.mouse = (
+            self.state.sidebar_w() as f64 + (col as f64 + 0.5) * cw,
+            crate::ui::HEADER_H as f64 + (row as f64 + 0.5) * ch,
+        );
+        self.state.refresh_link_hover();
+        self.state.link_under_cursor().map(|(target, _)| target)
     }
 
     /// Scroll the shown terminal back into its scrollback by `lines` (positive

@@ -52,6 +52,28 @@ struct SessionCfg {
     command: String,
 }
 
+/// Top-level backend settings in the layout file, orthogonal to the tree
+/// (parsed separately so the two schemas stay independent). `tmux: true` backs
+/// every session with a tmux session on a dedicated server socket — sessions
+/// survive app restarts and can be attached from elsewhere
+/// (`tmux -L termset attach -t <name>`, e.g. over SSH from a phone).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct Settings {
+    /// Back sessions with tmux (requires tmux ≥ 3.2 on PATH; silently falls
+    /// back to plain local PTYs, with a stderr warning, when missing).
+    #[serde(default)]
+    pub tmux: bool,
+    /// Server socket name (`tmux -L <socket>`). Default `termset`.
+    #[serde(default)]
+    pub tmux_socket: Option<String>,
+}
+
+/// Parse the backend [`Settings`] out of the layout YAML. Same degrade-to-
+/// default policy as [`parse_workspace`]: malformed YAML means defaults.
+pub(crate) fn parse_settings(text: &str) -> Settings {
+    serde_yaml::from_str(text).unwrap_or_default()
+}
+
 /// Parse the YAML layout file into a tree. Malformed YAML degrades to an empty
 /// layout rather than panicking. Empty sections are kept (they render as bare
 /// headers).

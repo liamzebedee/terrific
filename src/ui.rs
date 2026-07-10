@@ -468,6 +468,91 @@ pub(crate) fn render_text_cmds(buf: &mut [u32], bw: usize, bh: usize, r: &mut Re
     }
 }
 
+/// Geometric coverage for a Unicode block / sextant / quadrant character, as a
+/// list of cell-relative pixel rects `(x0, y0, x1, y1)` plus a coverage alpha
+/// (255 except the three shade blocks). Returns `None` for anything we don't
+/// draw this way, so the caller falls back to the font glyph.
+///
+/// Why draw these instead of rasterizing the font: the primary face (Ubuntu
+/// Mono) lacks most of them, and the OS fallback that *does* carry the sextants
+/// (Noto Sans Symbols2) designs them on its own em — they rasterize ~16px wide
+/// with a 16px advance, far larger than the ~10px terminal cell, so they overlap
+/// their neighbours and leave gaps. A QR code built from sextants (what `expo
+/// start` prints) is then unscannable. Filling the cell exactly makes adjacent
+/// cells tile seamlessly, matching kitty/foot/WezTerm.
+fn block_cell(c: char, w: usize, h: usize) -> Option<(Vec<(usize, usize, usize, usize)>, u32)> {
+    // Sub-cell boundary at `n/parts` of a dimension, rounded so that a boundary
+    // shared by adjacent cells lands on the same pixel (no seam, no overlap).
+    let ex = |n: usize, parts: usize| (n * w + parts / 2) / parts;
+    let ey = |n: usize, parts: usize| (n * h + parts / 2) / parts;
+
+    // Shades cover the whole cell at reduced opacity.
+    match c {
+        '\u{2591}' => return Some((vec![(0, 0, w, h)], 64)),
+        '\u{2592}' => return Some((vec![(0, 0, w, h)], 128)),
+        '\u{2593}' => return Some((vec![(0, 0, w, h)], 192)),
+        _ => {}
+    }
+
+    let rects = match c {
+        // Upper half + lower eighths (2580..2588).
+        '\u{2580}' => vec![(0, 0, w, ey(4, 8))],
+        '\u{2581}' => vec![(0, ey(7, 8), w, h)],
+        '\u{2582}' => vec![(0, ey(6, 8), w, h)],
+        '\u{2583}' => vec![(0, ey(5, 8), w, h)],
+        '\u{2584}' => vec![(0, ey(4, 8), w, h)],
+        '\u{2585}' => vec![(0, ey(3, 8), w, h)],
+        '\u{2586}' => vec![(0, ey(2, 8), w, h)],
+        '\u{2587}' => vec![(0, ey(1, 8), w, h)],
+        '\u{2588}' => vec![(0, 0, w, h)], // full block
+        // Left eighths (2589..258F) + left half (258C sits at 4/8).
+        '\u{2589}' => vec![(0, 0, ex(7, 8), h)],
+        '\u{258A}' => vec![(0, 0, ex(6, 8), h)],
+        '\u{258B}' => vec![(0, 0, ex(5, 8), h)],
+        '\u{258C}' => vec![(0, 0, ex(4, 8), h)],
+        '\u{258D}' => vec![(0, 0, ex(3, 8), h)],
+        '\u{258E}' => vec![(0, 0, ex(2, 8), h)],
+        '\u{258F}' => vec![(0, 0, ex(1, 8), h)],
+        '\u{2590}' => vec![(ex(4, 8), 0, w, h)], // right half
+        '\u{2594}' => vec![(0, 0, w, ey(1, 8))], // upper 1/8
+        '\u{2595}' => vec![(ex(7, 8), 0, w, h)], // right 1/8
+        // Quadrants (2596..259F): 2×2 mask, bits UL=1 UR=2 LL=4 LR=8.
+        '\u{2596}'..='\u{259F}' => {
+            const QUAD: [u8; 10] = [4, 8, 1, 13, 9, 7, 11, 2, 6, 14];
+            let mask = QUAD[c as usize - 0x2596];
+            let (mx, my) = (ex(1, 2), ey(1, 2));
+            let mut v = Vec::new();
+            if mask & 1 != 0 { v.push((0, 0, mx, my)); }
+            if mask & 2 != 0 { v.push((mx, 0, w, my)); }
+            if mask & 4 != 0 { v.push((0, my, mx, h)); }
+            if mask & 8 != 0 { v.push((mx, my, w, h)); }
+            v
+        }
+        // Sextants (1FB00..1FB3B): 2 cols × 3 rows. The code points enumerate the
+        // 6-bit patterns 1..=62 skipping 21 (=left half) and 42 (=right half),
+        // which already have block chars. Bit order: 0 TL, 1 TR, 2 ML, 3 MR,
+        // 4 BL, 5 BR (verified against the Unicode BLOCK SEXTANT-nnn names).
+        '\u{1FB00}'..='\u{1FB3B}' => {
+            let mut val = (c as u32 - 0x1FB00) + 1;
+            if val >= 21 { val += 1; }
+            if val >= 42 { val += 1; }
+            let cols = [(0, ex(1, 2)), (ex(1, 2), w)];
+            let rows = [(0, ey(1, 3)), (ey(1, 3), ey(2, 3)), (ey(2, 3), h)];
+            let mut v = Vec::new();
+            for (bit, rr, cc) in [(0, 0, 0), (1, 0, 1), (2, 1, 0), (3, 1, 1), (4, 2, 0), (5, 2, 1)] {
+                if val & (1 << bit) != 0 {
+                    let (x0, x1) = cols[cc];
+                    let (y0, y1) = rows[rr];
+                    v.push((x0, y0, x1, y1));
+                }
+            }
+            v
+        }
+        _ => return None,
+    };
+    Some((rects, 255))
+}
+
 /// Render the visible grid of one terminal into `buf` at an arbitrary scale.
 /// All geometry is in *target* pixels, so the same routine serves the logical
 /// 1× compose (`paint`) and the crisp device-resolution Retina pass (`redraw`):
@@ -531,7 +616,22 @@ pub(crate) fn draw_terminal_cells(
 
         let c = cell.c;
         let drawable = c != ' ' && c != '\0' && !cell.flags.contains(Flags::HIDDEN);
-        if drawable {
+        // Block / sextant / quadrant glyphs are filled geometrically so they
+        // tile seamlessly cell-to-cell (see `block_cell`) — a font glyph for
+        // these is either missing or sized on the wrong em and won't line up.
+        if drawable && let Some((rects, cov)) = block_cell(c, cell_w, cell_h) {
+            for (rx0, ry0, rx1, ry1) in rects {
+                let left = (x0 + rx0).max(origin_x);
+                let right = (x0 + rx1).min(clip_right).min(bw);
+                let bottom = (y0 + ry1).min(bh);
+                for py in (y0 + ry0)..bottom {
+                    for px in left..right {
+                        let idx = py * bw + px;
+                        buf[idx] = if cov == 255 { fg } else { blend(fg, buf[idx], cov) };
+                    }
+                }
+            }
+        } else if drawable {
             let g = r.glyph(c, font_style(cell.flags), font_px);
             for gy in 0..g.h {
                 let py = y0 as i32 + g.top + gy as i32;

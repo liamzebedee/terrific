@@ -37,7 +37,17 @@ Rules:
   winit event loop). Functional-core / imperative-shell; see the module header.
 - `src/config.rs` — the on-disk YAML layout schema, parsing it into the in-memory
   `Tree`, tilde expansion, and resolving which layout file to open. The layout
-  file is **read-only** to the app — never written back.
+  file is **read-only** to the app — never written back. Also the top-level
+  backend `Settings` (`tmux: true`, `tmux_socket:`).
+- `src/tmux.rs` — the tmux control-mode backend (`tmux: true` layouts): one
+  `tmux -C` client per tab, sessions on a dedicated server socket so they
+  survive the app and can be attached externally (`tmux -L termset attach -t
+  <name>`). Pure protocol layer (`Parser`, `unescape`) + effectful `spawn`/
+  `Client`; winit-free — events surface through a callback. Its live tests run
+  a real tmux on a private socket and skip when tmux isn't installed.
+  Gotcha discovered empirically (tmux 3.4): two control clients racing to
+  *create* a server on a fresh socket kill it at birth, so `spawn` runs a
+  synchronous `start-server` first and the generated conf sets `exit-empty off`.
 - `src/ui.rs` — rendering and chrome: palette, embedded backdrop, framebuffer
   drawing primitives, Win2k-style widgets (sidebar, inspector, context menu),
   and chrome geometry / hit-testing.

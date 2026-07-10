@@ -42,6 +42,7 @@ use winit::window::{CursorIcon, Window, WindowId};
 pub mod testkit;
 
 mod config;
+mod tmux;
 mod ui;
 use config::*;
 use ui::*;
@@ -661,6 +662,10 @@ enum UserEvent {
     /// A program asked to put text on the system clipboard (OSC 52 write).
     /// The clipboard is global, so no session id is needed.
     ClipboardStore(String),
+    /// tmux backend: the pane's shell pid arrived from the control-mode
+    /// handshake (async — the session spawns with pid 0, the "nothing to
+    /// observe yet" sentinel, until this lands).
+    ShellPid(u64, u32),
 }
 
 /// `EventListener` impl handed to `alacritty_terminal`. Forwards the events we
@@ -959,20 +964,58 @@ fn fallback_font_paths() -> Vec<String> {
 
 
 
-/// One terminal session: its own PTY thread + VT state machine + grid size.
-/// Reused as-is; `spawn_session` now also returns the shell pid for `/proc`.
+/// Where a tab's bytes come from and go to. The `Term` (VT state machine,
+/// grid, scrollback) is identical either way — only the transport differs.
+enum Io {
+    /// A local PTY with `alacritty_terminal`'s reader/writer thread behind it.
+    Pty(EventLoopSender),
+    /// A tmux control-mode client: the session lives on a tmux server and
+    /// survives this process (see `src/tmux.rs`).
+    Tmux(tmux::Client),
+    /// Headless harness session — writes vanish, output is fed directly.
+    Null,
+}
+
+/// One terminal session: its own I/O backend + VT state machine + grid size.
 struct Tab {
     term: Arc<FairMutex<Term<Listener>>>,
-    /// PTY input channel. `None` for a headless harness session (no real
-    /// PTY); every write goes through `App::send_to`, which then no-ops.
-    pty_tx: Option<EventLoopSender>,
+    io: Io,
     size: TermSize,
     title: String,
 }
 
-/// Spawn a fresh PTY-backed terminal session in `workdir`, sized to the
-/// current terminal area. Runs no command — it only lands a shell in the right
-/// directory. Returns the session and the shell's pid (for `observe`).
+impl Tab {
+    /// Type bytes into the session (keystrokes, pastes, escape replies). The
+    /// tmux path routes through `send-keys`, so replies our `Term` generates
+    /// (color queries, DSR) arrive at the pane's app exactly as terminal input
+    /// should — and queries tmux answers itself never reach us, so there is no
+    /// double-reply in either direction.
+    fn write(&self, bytes: Vec<u8>) {
+        match &self.io {
+            Io::Pty(tx) => {
+                let _ = tx.send(Msg::Input(bytes.into()));
+            }
+            Io::Tmux(c) => c.send_bytes(&bytes),
+            Io::Null => {}
+        }
+    }
+}
+
+/// Which transport a new session should get. Decided per leaf by
+/// `App::backend_for` (layout `tmux:` flag, tmux availability, and whether the
+/// leaf is a UI-helper that shouldn't outlive the app).
+enum Backend {
+    Pty,
+    Tmux { socket: String, session: String },
+}
+
+/// Spawn a fresh terminal session in `workdir`, sized to the current terminal
+/// area. Runs no command — it only lands a shell in the right directory.
+/// Returns the session and the shell's pid (for `observe`); the tmux backend
+/// returns pid 0 and delivers the real pid later via `UserEvent::ShellPid`
+/// (its handshake is asynchronous). A tmux spawn failure (server unreachable,
+/// conf unwritable) degrades to the PTY path with a warning rather than a dead
+/// tab.
 fn spawn_session(
     proxy: &EventLoopProxy<UserEvent>,
     id: u64,
@@ -981,6 +1024,7 @@ fn spawn_session(
     size: TermSize,
     cell_w: usize,
     cell_h: usize,
+    backend: Backend,
 ) -> (Tab, u32) {
     let window_size = WindowSize {
         num_cols: size.cols as u16,
@@ -994,6 +1038,41 @@ fn spawn_session(
     };
     let term = Term::new(Config::default(), &size, listener.clone());
     let term = Arc::new(FairMutex::new(term));
+
+    if let Backend::Tmux { socket, session } = backend {
+        let cfg = tmux::Spawn {
+            socket,
+            session,
+            workdir: workdir.clone().filter(|p| p.is_dir()),
+            cols: size.cols as u16,
+            lines: size.lines as u16,
+        };
+        let ev_proxy = proxy.clone();
+        let res = tmux::spawn(&cfg, term.clone(), move |ev| {
+            let _ = ev_proxy.send_event(match ev {
+                tmux::Event::Wakeup => UserEvent::Wakeup,
+                tmux::Event::Exit => UserEvent::Exit(id),
+                tmux::Event::ShellPid(pid) => UserEvent::ShellPid(id, pid),
+            });
+        });
+        match res {
+            // pid 0 = "nothing to observe yet"; ShellPid fills it in.
+            Ok(client) => {
+                return (
+                    Tab {
+                        term,
+                        io: Io::Tmux(client),
+                        size,
+                        title,
+                    },
+                    0,
+                );
+            }
+            Err(e) => {
+                eprintln!("termset: tmux session {:?} failed ({e}); falling back to a local PTY", cfg.session);
+            }
+        }
+    }
 
     // Don't rely on inheriting TERM: launched from the .desktop entry there
     // is no controlling terminal, so TERM is unset and the shell's rc files
@@ -1035,12 +1114,34 @@ fn spawn_session(
     (
         Tab {
             term,
-            pty_tx: Some(pty_tx),
+            io: Io::Pty(pty_tx),
             size,
             title,
         },
         pid,
     )
+}
+
+/// The tmux session name for a leaf: its sanitized display name, made unique
+/// across the tree by a numeric suffix in tree order ("web", "web-2", …).
+/// Deterministic per layout, so re-launches adopt the sessions they created —
+/// and short, because someone will type it on a phone (`tmux attach -t web`).
+fn tmux_session_name(tree: &Tree, node: NodeId) -> String {
+    let name = tmux::sanitize_name(&tree.nodes[node].name);
+    let mut before = 0;
+    for leaf in tree.leaves(tree.root) {
+        if leaf == node {
+            break;
+        }
+        if tmux::sanitize_name(&tree.nodes[leaf].name) == name {
+            before += 1;
+        }
+    }
+    if before == 0 {
+        name
+    } else {
+        format!("{name}-{}", before + 1)
+    }
 }
 
 /// The directory the layout file lives in — the base for resolving relative
@@ -1183,10 +1284,10 @@ struct State {
     /// The sidebar row the pointer is currently over (if any), drawn with a
     /// faint hover fill. `None` when off the tree or over the selected row.
     sidebar_hover: Option<NodeId>,
-    /// Grid cells of the URL under the pointer while Ctrl is held — drawn
-    /// underlined so the link reads as clickable. Empty when no link is
-    /// hovered (or Ctrl is up). Ctrl+click on any of these opens the URL.
-    /// Keyed by `(line, column)` since `Point` itself isn't `Hash`.
+    /// Grid cells of the link under the pointer (URL or existing file path) —
+    /// drawn underlined so it reads as clickable. Empty when no link is
+    /// hovered. Ctrl+click on any of these opens it. Keyed by
+    /// `(line, column)` since `Point` itself isn't `Hash`.
     link_cells: HashSet<(i32, usize)>,
 }
 
@@ -1660,9 +1761,10 @@ impl State {
         Some((row.id, row.is_group))
     }
 
-    /// The URL under the pointer, if the pointer is inside the shown terminal's
-    /// viewport and sits on a link. Returns the URL text and the grid cells it
-    /// spans. Does not consider the modifier state — callers gate on Ctrl.
+    /// The link under the pointer, if the pointer is inside the shown
+    /// terminal's viewport and sits on one. Returns the open target (URL, or
+    /// resolved absolute file path) and the grid cells it spans. Does not
+    /// consider the modifier state — callers gate on Ctrl.
     fn link_under_cursor(&self) -> Option<(String, Vec<Point>)> {
         let node = self.shown()?;
         let (pw, _) = self.logical_size();
@@ -1678,7 +1780,19 @@ impl State {
         let size = self.sessions[&node].tab.size;
         let term = self.sessions[&node].tab.term.lock();
         let (point, _) = self.pixel_to_point(&term, size);
-        url_at(&term, point)
+        if let Some(hit) = url_at(&term, point) {
+            return Some(hit);
+        }
+        // No URL — try a bare file path (`/var/log/syslog`, `~/notes.md`,
+        // `src/ui.rs`). Candidates only count when they exist on disk, with
+        // relative ones checked against the shell's *current* cwd — that's
+        // what makes compiler output clickable without lighting up every
+        // `either/or` in prose.
+        let (cand, pts) = path_at(&term, point)?;
+        drop(term);
+        let cwd = proc_cwd(self.sessions[&node].shell_pid);
+        let path = resolve_path(&cand, cwd.as_deref(), &home_dir())?;
+        Some((path.display().to_string(), pts))
     }
 
     /// Text to offer "Search Google" on: the active selection if there is one,
@@ -1891,6 +2005,74 @@ fn find_url(chars: &[char], hover: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// Characters that may sit inside a bare file path. Deliberately narrower than
+/// [`is_url_char`]: quotes, brackets and `:` act as delimiters, so `(src/a.rs)`
+/// and the compiler's `src/a.rs:42:13` both yield just the path. Spaces split —
+/// paths containing them need quoting the detector doesn't attempt.
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(
+            c,
+            '/' | '.' | '_' | '-' | '~' | '+' | '@' | '#' | '$' | '%' | '&' | '='
+        )
+}
+
+/// Locate the file-path candidate covering character index `hover`: the
+/// maximal run of path characters around it, trailing prose punctuation
+/// trimmed, containing at least one `/` (a slashless word is prose, not a
+/// path). Pure and deliberately credulous — the caller must confirm the
+/// candidate actually exists ([`resolve_path`]) before treating it as a link.
+/// Taking the *whole* run (never a suffix) is what keeps `/etc/passwd` inside
+/// `x.com/etc/passwd` from matching: the candidate is the full run, which
+/// doesn't exist on disk.
+fn find_path(chars: &[char], hover: usize) -> Option<(usize, usize)> {
+    if hover >= chars.len() || !is_path_char(chars[hover]) {
+        return None;
+    }
+    let mut start = hover;
+    while start > 0 && is_path_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = hover + 1;
+    while end < chars.len() && is_path_char(chars[end]) {
+        end += 1;
+    }
+    while end > start + 1 && is_url_trailer(chars[end - 1]) {
+        end -= 1;
+    }
+    // Hover sat on the trimmed tail (`see /var/log.` with the pointer on `.`).
+    if hover >= end || !chars[start..end].contains(&'/') {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// The file-path candidate under `point`, as [`url_at`] but for bare paths:
+/// the candidate text and the grid cells it covers. Existence is *not*
+/// checked here — the caller owns that (it needs the shell's cwd).
+fn path_at(term: &Term<Listener>, point: Point) -> Option<(String, Vec<Point>)> {
+    let (chars, points, _, hover) = logical_line(term, point)?;
+    let (start, end) = find_path(&chars, hover)?;
+    Some((chars[start..end].iter().collect(), points[start..end].to_vec()))
+}
+
+/// Resolve a path candidate to something openable, or `None` if it doesn't
+/// exist: absolute paths stand alone, `~` expands against `home`, everything
+/// else (`./x`, `../x`, `src/lib.rs`) is relative to the shell's cwd — no cwd
+/// (dead session, pid not yet known) means relative candidates can't resolve.
+/// The existence check is the anti-false-positive gate for prose like
+/// `and/or`, so it is not optional.
+fn resolve_path(cand: &str, cwd: Option<&Path>, home: &Path) -> Option<PathBuf> {
+    let p = if cand.starts_with('/') {
+        PathBuf::from(cand)
+    } else if cand == "~" || cand.starts_with("~/") {
+        expand_tilde(cand, home)
+    } else {
+        cwd?.join(cand)
+    };
+    p.exists().then_some(p)
+}
+
 /// Open a URL in the user's default handler, detached so the terminal never
 /// blocks on it. Best-effort: a missing opener is silently ignored.
 fn open_url(url: &str) {
@@ -1933,6 +2115,10 @@ struct App {
     /// The window is created hidden and revealed once, after the first frame
     /// is presented, so no blank surface flashes on open.
     revealed: bool,
+    /// `Some(socket)` when the layout opted into the tmux backend (`tmux:
+    /// true`) *and* a tmux binary exists. `None` = classic local PTYs.
+    /// Resolved once in `resumed` (the layout file is read there).
+    tmux_socket: Option<String>,
 }
 
 impl App {
@@ -1958,9 +2144,25 @@ impl App {
         }
     }
 
-    /// Effect: spawn an idle PTY for leaf `node` in its workdir.
+    /// Which transport leaf `node` should get. Volatile UI-helper tabs (the
+    /// "Edit Config" nano) always get a local PTY — persisting an editor
+    /// session on the tmux server after the app closes would be surprising,
+    /// and it's a local affordance, not a workspace session.
+    fn backend_for(&self, node: NodeId) -> Backend {
+        match (&self.tmux_socket, &self.state) {
+            (Some(socket), Some(st)) if !st.tree.nodes[node].volatile => Backend::Tmux {
+                socket: socket.clone(),
+                session: tmux_session_name(&st.tree, node),
+            },
+            _ => Backend::Pty,
+        }
+    }
+
+    /// Effect: spawn an idle session (shell, no command) for leaf `node` in
+    /// its workdir.
     fn spawn_for(&mut self, node: NodeId) {
         let base = layout_dir(&self.ws_path);
+        let backend = self.backend_for(node);
         let Some(st) = self.state.as_mut() else { return };
         if st.sessions.contains_key(&node) {
             return;
@@ -1983,19 +2185,15 @@ impl App {
             size,
             st.renderer.cell_w,
             st.renderer.cell_h,
+            backend,
         );
         st.id_of.insert(id, node);
         st.sessions.insert(node, Session { tab, shell_pid: pid });
     }
 
     fn send_to(&self, node: NodeId, bytes: Vec<u8>) {
-        if let Some(tx) = self
-            .state
-            .as_ref()
-            .and_then(|st| st.sessions.get(&node))
-            .and_then(|s| s.tab.pty_tx.as_ref())
-        {
-            let _ = tx.send(Msg::Input(bytes.into()));
+        if let Some(s) = self.state.as_ref().and_then(|st| st.sessions.get(&node)) {
+            s.tab.write(bytes);
         }
     }
 
@@ -2026,9 +2224,7 @@ impl App {
             for _ in 0..lines.unsigned_abs() {
                 bytes.extend_from_slice(seq);
             }
-            if let Some(tx) = &session.tab.pty_tx {
-                let _ = tx.send(Msg::Input(bytes.into()));
-            }
+            session.tab.write(bytes);
         } else {
             term.scroll_display(Scroll::Delta(lines));
             drop(term);
@@ -2162,13 +2358,28 @@ impl App {
     }
 
     /// Tear down the selected session. Dynamic (scratch) leaves are removed
-    /// from the tree; spec leaves stay so they can be re-started.
+    /// from the tree; spec leaves stay so they can be re-started. On the tmux
+    /// backend "tear down" splits by leaf kind: a spec leaf *detaches* (the
+    /// session keeps running on the server — Start re-adopts it, complete with
+    /// scrollback), while a scratch leaf's session is killed outright (closing
+    /// a scratch tab means discarding it; detaching would strand invisible
+    /// sessions on the server).
     fn close_selected(&mut self) {
         let Some(st) = self.state.as_mut() else { return };
         let node = st.selected;
         if let Some(s) = st.sessions.remove(&node) {
-            if let Some(tx) = &s.tab.pty_tx {
-                let _ = tx.send(Msg::Shutdown);
+            match &s.tab.io {
+                Io::Pty(tx) => {
+                    let _ = tx.send(Msg::Shutdown);
+                }
+                Io::Tmux(c) => {
+                    if st.tree.nodes[node].dynamic {
+                        c.kill_session();
+                    } else {
+                        c.detach();
+                    }
+                }
+                Io::Null => {}
             }
             st.id_of.retain(|_, &mut v| v != node);
         }
@@ -2251,8 +2462,14 @@ impl App {
         for s in st.sessions.values_mut() {
             s.tab.size = size;
             s.tab.term.lock().resize(size);
-            if let Some(tx) = &s.tab.pty_tx {
-                let _ = tx.send(Msg::Resize(ws));
+            match &s.tab.io {
+                Io::Pty(tx) => {
+                    let _ = tx.send(Msg::Resize(ws));
+                }
+                // The server resizes the window to follow this client
+                // (`window-size latest`) and repaints via `%output`.
+                Io::Tmux(c) => c.resize(size.cols as u16, size.lines as u16),
+                Io::Null => {}
             }
         }
         st.request_redraw();
@@ -2587,6 +2804,22 @@ impl ApplicationHandler<UserEvent> for App {
         if ws_text.trim().is_empty() {
             ws_text = default_workspace_text();
         }
+        // Backend opt-in (`tmux: true`) lives in the same file as the tree.
+        // Requested-but-unavailable degrades loudly to PTYs: a broken layout
+        // should never mean a window with no terminals.
+        let settings = parse_settings(&ws_text);
+        self.tmux_socket = if settings.tmux {
+            if tmux::available() {
+                Some(settings.tmux_socket.unwrap_or_else(|| "termset".into()))
+            } else {
+                eprintln!(
+                    "termset: layout requests the tmux backend but no tmux binary was found; using local PTYs"
+                );
+                None
+            }
+        } else {
+            None
+        };
         let tree = parse_workspace(&ws_text, &home);
 
         let inner = window.inner_size();
@@ -2645,7 +2878,11 @@ impl ApplicationHandler<UserEvent> for App {
         let (lw, lh) = st.logical_size();
         let size = st.grid_size(lw, lh);
 
-        // On open: an idle PTY per spec leaf — cwd set, no command run.
+        // On open: an idle session per spec leaf — cwd set, no command run.
+        // On the tmux backend this *adopts* any session of the same name left
+        // on the server by a previous run: shells (and their scrollback)
+        // survive app restarts.
+        let tmux_socket = self.tmux_socket.clone();
         let leaves = st.tree.leaves(st.tree.root);
         for node in leaves {
             let (Some((workdir, _)), name) = (
@@ -2653,6 +2890,13 @@ impl ApplicationHandler<UserEvent> for App {
                 st.tree.nodes[node].name.clone(),
             ) else {
                 continue;
+            };
+            let backend = match &tmux_socket {
+                Some(socket) if !st.tree.nodes[node].volatile => Backend::Tmux {
+                    socket: socket.clone(),
+                    session: tmux_session_name(&st.tree, node),
+                },
+                _ => Backend::Pty,
             };
             let id = st.next_id;
             st.next_id += 1;
@@ -2664,6 +2908,7 @@ impl ApplicationHandler<UserEvent> for App {
                 size,
                 st.renderer.cell_w,
                 st.renderer.cell_h,
+                backend,
             );
             st.id_of.insert(id, node);
             st.sessions.insert(node, Session { tab, shell_pid: pid });
@@ -2687,7 +2932,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(st) = self.state.as_mut() {
                     if let Some(&node) = st.id_of.get(&id) {
                         if let Some(s) = st.sessions.remove(&node) {
-                            if let Some(tx) = &s.tab.pty_tx {
+                            // A tmux client that reported Exit is already
+                            // gone; dropping it is enough.
+                            if let Io::Pty(tx) = &s.tab.io {
                                 let _ = tx.send(Msg::Shutdown);
                             }
                         }
@@ -2739,6 +2986,15 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ClipboardStore(text) => {
                 if let Some(cb) = self.state.as_mut().and_then(|st| st.clipboard.as_mut()) {
                     let _ = cb.set_text(text);
+                }
+            }
+            UserEvent::ShellPid(id, pid) => {
+                if let Some(st) = self.state.as_mut() {
+                    if let Some(&node) = st.id_of.get(&id) {
+                        if let Some(s) = st.sessions.get_mut(&node) {
+                            s.shell_pid = pid;
+                        }
+                    }
                 }
             }
             UserEvent::FallbackFonts(fonts) => {
@@ -3259,6 +3515,7 @@ pub fn run() {
         surface: None,
         ws_path,
         revealed: false,
+        tmux_socket: None,
     };
     event_loop.run_app(&mut app).expect("run");
 }
@@ -3298,6 +3555,98 @@ mod tests {
         assert_eq!(url_in("see https://example.com here", "here"), None);
         // No scheme, no link.
         assert_eq!(url_in("just example.com text", "example"), None);
+    }
+
+    fn path_in(line: &str, hover_on: &str) -> Option<String> {
+        let chars: Vec<char> = line.chars().collect();
+        let hover = line.find(hover_on).unwrap();
+        find_path(&chars, hover).map(|(a, b)| chars[a..b].iter().collect())
+    }
+
+    #[test]
+    fn detects_path_candidates_under_the_pointer() {
+        // Plain absolute path, hovering anywhere inside it.
+        assert_eq!(
+            path_in("tail -f /var/log/syslog now", "log"),
+            Some("/var/log/syslog".to_string())
+        );
+        // Tilde and relative forms.
+        assert_eq!(path_in("edit ~/notes.md today", "notes"), Some("~/notes.md".to_string()));
+        assert_eq!(path_in("run ./scripts/x.sh", "scripts"), Some("./scripts/x.sh".to_string()));
+        // Compiler output: `:` delimits, so the line:col tail stays off the
+        // path — and hovering the numbers is not hovering a path.
+        assert_eq!(path_in(" --> src/ui.rs:100:5", "ui.rs"), Some("src/ui.rs".to_string()));
+        assert_eq!(path_in(" --> src/ui.rs:100:5", "100"), None);
+        // Wrapping brackets/quotes delimit; trailing sentence punctuation trims.
+        assert_eq!(path_in("see (src/lib.rs) there", "lib"), Some("src/lib.rs".to_string()));
+        assert_eq!(path_in("in /etc/hosts.", "hosts"), Some("/etc/hosts".to_string()));
+        // ...but hovering the trimmed punctuation itself is not a hit.
+        assert_eq!(path_in("in /etc/hosts.", "."), None);
+        // A slashless word is prose, not a path; so is whitespace.
+        assert_eq!(path_in("open Makefile now", "Makefile"), None);
+        assert_eq!(path_in("a b", " "), None);
+        // The candidate is the whole run, never a suffix: an URL's path part
+        // drags the host along (and then fails the existence check).
+        assert_eq!(
+            path_in("x.com/etc/passwd", "etc"),
+            Some("x.com/etc/passwd".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_paths_against_cwd_home_and_disk() {
+        // A throwaway directory tree: base/{file.txt, sub/inner.txt}
+        let base = std::env::temp_dir().join(format!("termset-path-test-{}", std::process::id()));
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(base.join("file.txt"), b"x").unwrap();
+        std::fs::write(sub.join("inner.txt"), b"x").unwrap();
+
+        let abs = base.join("file.txt");
+        // Absolute: exists → resolved as-is; missing → None.
+        assert_eq!(
+            resolve_path(&abs.display().to_string(), None, &base),
+            Some(abs.clone())
+        );
+        assert_eq!(resolve_path("/definitely/not/here-42", Some(&base), &base), None);
+        // Relative resolves against the shell cwd — and dies without one.
+        assert_eq!(
+            resolve_path("sub/inner.txt", Some(&base), Path::new("/nowhere")),
+            Some(sub.join("inner.txt"))
+        );
+        assert_eq!(resolve_path("./file.txt", Some(&base), &base), Some(base.join("./file.txt")));
+        assert_eq!(resolve_path("sub/inner.txt", None, &base), None);
+        // Tilde expands against home (here: the temp base), not cwd.
+        assert_eq!(
+            resolve_path("~/file.txt", None, &base),
+            Some(base.join("file.txt"))
+        );
+        // Directories are openable too (file manager).
+        assert_eq!(resolve_path("sub", Some(&base), &base), Some(sub.clone()));
+        // Prose that merely looks pathish doesn't exist → no link.
+        assert_eq!(resolve_path("either/or", Some(&base), &base), None);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// End to end through the real pointer path (viewport offsets, grid
+    /// lookup, detection, resolution) via the headless harness — the same
+    /// plumbing a real mouse move and Ctrl+click use.
+    #[test]
+    fn hovering_paths_and_urls_in_a_real_session() {
+        let mut h = crate::testkit::Harness::new(FIXTURE);
+        h.feed(
+            "Apps/qwen",
+            "cat /etc/hosts\r\nvisit https://example.com/x now\r\nprose with either/or here\r\nmissing ~/no-such-file-42q\r\n",
+        );
+        // An existing absolute path is a link, and the target is the path itself.
+        assert_eq!(h.hover_text("/etc/hosts"), Some("/etc/hosts".into()));
+        // URLs keep working, and win over path detection.
+        assert_eq!(h.hover_text("example.com"), Some("https://example.com/x".into()));
+        // Pathish prose that doesn't exist on disk is not a link; neither is
+        // a tilde path that doesn't resolve.
+        assert_eq!(h.hover_text("either/or"), None);
+        assert_eq!(h.hover_text("~/no-such-file-42q"), None);
     }
 
     #[test]
