@@ -62,7 +62,11 @@ Rules:
 - `.github/workflows/macos.yml` — real-Mac CI: runs the tests on a GitHub macOS
   runner, launches the actual app there, and uploads all screenshots (harness
   PNGs + a live screen capture) as a `macos-screenshots` artifact.
-- `scripts/install-icon.sh` — installs the icon + `.desktop` launcher (idempotent).
+- `scripts/install-icon.sh` — installs the icon + `.desktop` launcher on Linux (idempotent).
+- `scripts/bundle-mac.sh` — packages a double-clickable macOS `dist/termset.app`
+  (rasterizes `termset.svg` → `.icns`, writes `Info.plist`, ad-hoc code-signs).
+  Not notarized yet — first launch is right-click → Open. `INSTALL=1` copies it to
+  `/Applications`.
 - `scripts/demo-screenshot.sh` — regenerates `demo/screenshot.png` for the README.
 - `termset.svg` — the app icon.
 - `assets/` — `default-termset.yml` (compiled-in default layout), `termset.desktop.in`
@@ -83,4 +87,5 @@ cargo run --bin terms <file> # run termset on a layout file
 cargo test                   # run tests (includes the screenshot harness)
 cargo run --example demo     # headless demo / screenshot
 bash scripts/install-icon.sh # (re)install icon + launcher on GNOME
+bash scripts/bundle-mac.sh   # build dist/termset.app (macOS); INSTALL=1 → /Applications
 ```

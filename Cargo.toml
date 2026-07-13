@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 alacritty_terminal = "0.26.0"
 arboard = "3.6.1"
+ed25519-compact = "2"
 fontdue = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
