@@ -1,0 +1,54 @@
+// AuthService — registration, login, and "who am I". Register and Login are
+// public; they return a signed JWT the client stores and sends as
+// `Authorization: Bearer <token>` on every subsequent request. Me echoes the
+// caller resolved from that token.
+
+syntax = "proto3";
+
+package app.v1;
+
+// The public shape of an account. Email is private — only ever returned to the
+// account's own owner (never to other users), so it's safe here.
+message UserView {
+  string id = 1;
+  string email = 2;
+  string username = 3;
+}
+
+message RegisterRequest {
+  string email = 1;
+  string username = 2;
+  string password = 3;
+}
+message RegisterResponse {
+  string token = 1;
+  UserView user = 2;
+}
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+}
+message LoginResponse {
+  string token = 1;
+  UserView user = 2;
+}
+
+message MeRequest {}
+message MeResponse {
+  UserView user = 1;
+}
+
+// Change the signed-in user's password (verifies the current one first).
+message ChangePasswordRequest {
+  string current_password = 1;
+  string new_password = 2;
+}
+message ChangePasswordResponse {}
+
+service AuthService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc Me(MeRequest) returns (MeResponse);
+  rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
+}

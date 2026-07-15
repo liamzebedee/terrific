@@ -1,0 +1,19 @@
+node_modules
+data.json
+bun.lock
+
+# env files — all gitignored except .env.local (the committed dev default)
+.env
+.env.*
+!.env.local
+!.env.example
+
+# local sqlite backups
+tmp/
+
+# prod database is never committed — it lives on the server
+data/prod/
+
+# sqlite sidecars — pre-commit hook checkpoints the WAL into db.sqlite3
+data/*/db.sqlite3-wal
+data/*/db.sqlite3-shm

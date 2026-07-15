@@ -1,0 +1,19 @@
+// TestService — the minimal RPC. A public, unauthenticated Ping that echoes its
+// message back, so you can verify the transport end-to-end (client → Connect
+// route → impl) without any auth or database. The smallest possible example of
+// a service.
+
+syntax = "proto3";
+
+package app.v1;
+
+message PingRequest {
+  string message = 1;
+}
+message PingResponse {
+  string message = 1;
+}
+
+service TestService {
+  rpc Ping(PingRequest) returns (PingResponse);
+}

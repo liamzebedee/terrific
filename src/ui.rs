@@ -33,15 +33,16 @@ pub(crate) const HOVER: u32 = 0x1c_1c_1c; // sidebar row hover fill (a hair abov
 // bevels, a subtle vertical gradient, compact fixed heights, dense layout,
 // left-aligned titles.
 // The sidebar auto-sizes to its content: the longest label plus this fixed
-// right margin (see `State::sidebar_w`). It is never narrower than `WBTN_W`. A
-// toggle (⌘B / Ctrl+Shift+B) hides it entirely (width 0).
+// right margin (see `State::sidebar_w`). It never fits fewer than
+// `SIDEBAR_MIN_CHARS` characters. A toggle (⌘B / Ctrl+Shift+B) hides it
+// entirely (width 0).
 pub(crate) const SIDEBAR_MARGIN: usize = 16; // fixed gap right of the longest label
 pub(crate) const SIDEBAR_PAD_L: usize = 6; // small left inset before each tree label
+pub(crate) const SIDEBAR_MIN_CHARS: usize = 5; // floor on the label area, in characters
 pub(crate) const HEADER_H: usize = 16; // title bar; one content row tall (= cell_h at FONT_PX) for uniform heights
 pub(crate) const ROW_H: usize = 20; // context-menu item height
 pub(crate) const CTX_W: usize = 150; // context-menu width (fits "Search Google")
 pub(crate) const RPANEL_W: usize = 252; // right inspector pane width
-pub(crate) const WBTN_W: usize = 30; // minimum sidebar width (also the old info-button width)
 pub(crate) const TLIGHT_CELL: usize = 18; // per-dot hit cell for the window controls
 pub(crate) const TLIGHT_R: f32 = 5.0; // traffic-light dot radius (px); diameter 10 in a 16px row
 pub(crate) const EDGE: f64 = 9.0; // borderless-window resize-grip thickness (edges)
@@ -761,6 +762,7 @@ pub(crate) fn draw_sidebar(
     selected: NodeId,
     hovered: Option<NodeId>,
     sidebar_w: usize,
+    scroll: usize,
 ) {
     fill_rect(buf, pw, ph, 0, 0, sidebar_w, ph, STRIP_BG);
     // Title-bar band, shared with the terminal header so the top strip reads as
@@ -780,7 +782,12 @@ pub(crate) fn draw_sidebar(
     let rh = r.cell_h;
     let tops = sidebar_row_tops(rows, rh);
     for (i, row) in rows.iter().enumerate() {
-        let y = HEADER_H + tops[i];
+        // Rows scrolled up past the top of the list are skipped; `scroll` is a
+        // multiple of `rh` so the survivors stay flush under the header.
+        if tops[i] < scroll {
+            continue;
+        }
+        let y = HEADER_H + tops[i] - scroll;
         if y + rh > ph {
             break;
         }

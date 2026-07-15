@@ -1,0 +1,25 @@
+// The database schema — the storage layout for the whole app, as one `Database`
+// message where every field is `repeated <Table>` (a table is a set of rows;
+// see protodatabase/README.md). Each table is a model in models/; this file
+// only assembles them into the schema registry that protodatabase reads.
+//
+// Owner-scoped: every domain row carries an `owner` (a User id), so the DB is a
+// set of per-user rows. `users` is the one exception (it IS the accounts).
+//
+// Physical tables are keyed by field NUMBER, so never change a field number or
+// name here without a migration. Retired tables leave a gap rather than
+// renumber a surviving table onto an occupied physical table.
+//
+// Generate:  bun run gen:db  (see package.json)
+
+syntax = "proto3";
+
+package app.db.v1;
+
+import "models/user.proto";
+import "models/item.proto";
+
+message Database {
+  repeated app.v1.User users = 1; // accounts
+  repeated app.v1.Item items = 2; // PK = id, owner-scoped example table
+}

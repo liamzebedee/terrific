@@ -1,0 +1,9 @@
+version: v2
+clean: true
+plugins:
+  # protoc-gen-es comes from node_modules (dev dependency @bufbuild/protoc-gen-es);
+  # it generates both message schemas and service descriptors.
+  # Paths are relative to this folder — run buf from src/proto/ (bun run gen does).
+  - local: ../../node_modules/.bin/protoc-gen-es
+    out: gen
+    opt: target=ts

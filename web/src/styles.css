@@ -1,0 +1,8 @@
+/* Global stylesheet, split by area into src/styles/. Plain CSS (NOT modules) —
+   every class name stays global. Edit the relevant area file below. The @import
+   order is the cascade order and must be preserved. */
+@import "./styles/reset.css";
+@import "./styles/base.css";
+@import "./styles/auth.css";
+@import "./styles/app.css";
+@import "./styles/landing.css";

@@ -1,0 +1,54 @@
+/* Reserve the scrollbar gutter (no visible track) so layout width is the same
+   whether or not a page is tall enough to scroll. */
+html { overflow-y: auto; scrollbar-gutter: stable; }
+html, body {
+  margin: 0;
+  font-family: -apple-system, system-ui, sans-serif;
+  color: #2a1f10;
+  background: #f3efe0;
+}
+
+/* Custom scrollbars (Chrome/Safari) */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: #c8bf9e;
+  border-radius: 5px;
+  border: 2px solid #f3efe0;
+}
+*::-webkit-scrollbar-thumb:hover { background: #8a7548; }
+*::-webkit-scrollbar-corner { background: transparent; }
+* { scrollbar-width: thin; scrollbar-color: #c8bf9e transparent; }
+
+.app { display: flex; flex-direction: column; min-height: 100vh; }
+
+.topbar {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #d8d0b6;
+  background: #ECE9D8;
+  align-items: center;
+}
+.tab {
+  height: 32px;
+  padding: 0 16px;
+  border: 1px solid #c8bf9e;
+  background: #f6f1de;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  display: inline-flex;
+  align-items: center;
+}
+.tab:hover { background: #fffaeb; }
+.tab.active { background: #5a4a2c; color: #f3efe0; border-color: #5a4a2c; }
+.spacer { flex: 1; }
+.app-title { font-weight: 600; letter-spacing: 0.04em; color: #5a4a2c; }
+
+.view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}

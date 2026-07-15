@@ -1,0 +1,64 @@
+// The database, as a single protobuf message.
+//
+// This is the whole idea: `message Database` is the schema. Each FIELD is a
+// TABLE, and the field's message TYPE supplies the COLUMNS. There are no
+// custom annotations — a table is just a message field, so the schema is plain
+// proto and every existing proto tool keeps working.
+//
+// ONE RULE: every field of `Database` is `repeated`. A relational database is
+// a repeated set of rows, so a table is always `repeated Row` — no map type, no
+// singletons, no special cases. A keyed table is just a row message that
+// carries its own key field (that's all `map` ever gave you), so `map` is
+// redundant. The generator rejects any non-repeated field here.
+//
+// Inside a row message, each field becomes a COLUMN:
+//   scalar (string/double/bool/int/…) → a typed SQL column (TEXT/REAL/INTEGER)
+//   anything else (message/repeated/map) → a BLOB column holding that field's
+//     raw protobuf encoding. No relational modelling, no child tables — nested
+//     data rides along as bytes and stays schema-evolvable for free.
+//
+// A row's primary key is its `id` field, if it has one; otherwise the table is
+// keyed by SQLite's implicit rowid and inserts append. Physical columns are
+// named by field NUMBER (`f1`, `f2`, …) so renames in the .proto never touch
+// the stored data. A generated VIEW re-exposes the real field names.
+
+syntax = "proto3";
+
+package db.v1;
+
+import "planner/v1/planner.proto";
+
+// Loose scalar settings that today live as individual kv keys (snacks, veggies,
+// gym, supps, feature flags). Declared locally to show a Database can mix
+// imported row types with ones defined right here.
+message Settings {
+  string snacks = 1;
+  string veggies = 2;
+  string gym = 3;
+  string supps = 4;
+  optional bool t1d_features = 5;
+  optional string lookup_backend = 6;
+}
+
+// A keyed table is just a row that carries its own key — no `map` needed. Here
+// `key` is the primary-key column and the whole Macros rides along as bytes.
+message NutritionRow {
+  string key = 1;
+  planner.v1.Macros macros = 2;
+}
+
+// The database. Every field is `repeated <Message>` — a set of rows. No maps,
+// no singletons.
+message Database {
+  // PK = Meal.id. All columns scalar (id, name, ingredients, list).
+  repeated planner.v1.Meal meals = 1;
+
+  // Keyed table: PK = key (TEXT), macros → BLOB.
+  repeated NutritionRow nutrition = 2;
+
+  // Keyless (rowid) tables holding one row each today, but nothing stops them
+  // holding more. Exercise message/repeated/map/optional columns → BLOB + REAL.
+  repeated planner.v1.Profile profile = 3;
+  repeated planner.v1.DaySim daysim = 4;
+  repeated Settings settings = 5;
+}

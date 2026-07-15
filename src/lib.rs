@@ -1284,6 +1284,15 @@ struct State {
     /// The sidebar row the pointer is currently over (if any), drawn with a
     /// faint hover fill. `None` when off the tree or over the selected row.
     sidebar_hover: Option<NodeId>,
+    /// Vertical scroll offset of the sidebar tree, in logical px (always a
+    /// multiple of the row height so rows stay grid-aligned under the header).
+    /// The wheel scrolls the pane when its content is taller than the window;
+    /// there is no visible scrollbar for the tree. Clamped so the last row can
+    /// just reach the bottom and no further.
+    sidebar_scroll: usize,
+    /// Sub-line wheel remainder for the sidebar, mirroring `scroll_acc` for the
+    /// terminal so a touchpad's small deltas accumulate into whole-row scrolls.
+    sidebar_scroll_acc: f64,
     /// Grid cells of the link under the pointer (URL or existing file path) —
     /// drawn underlined so it reads as clickable. Empty when no link is
     /// hovered. Ctrl+click on any of these opens it. Keyed by
@@ -1446,6 +1455,9 @@ impl State {
         let sel = self.selected;
         let rows = self.tree.rows(sel);
         if sw > 0 {
+            // Keep the offset in range as the tree grows/shrinks (folding a
+            // group, closing a session) so we never scroll past the last row.
+            self.sidebar_scroll = self.sidebar_scroll.min(self.sidebar_max_scroll(&rows));
             draw_sidebar(
                 &mut buf,
                 pw,
@@ -1455,6 +1467,7 @@ impl State {
                 sel,
                 self.sidebar_hover,
                 sw,
+                self.sidebar_scroll,
             );
         }
 
@@ -1680,10 +1693,10 @@ impl State {
     }
 
     /// Logical width of the sidebar pane: `0` when hidden, otherwise the left
-    /// label inset plus the longest label plus a fixed right margin (never
-    /// narrower than `WBTN_W`). All chrome geometry and hit-testing derive from
-    /// this, so the pane grows and shrinks to fit its content and vanishes when
-    /// toggled off.
+    /// label inset plus the longest label plus a fixed right margin (with room
+    /// for at least `SIDEBAR_MIN_CHARS` characters). All chrome geometry and
+    /// hit-testing derive from this, so the pane grows and shrinks to fit its
+    /// content and vanishes when toggled off.
     ///
     /// The width fits the longest label across *every* node — all groups and
     /// leaves, whether or not their parent is currently expanded — so the pane
@@ -1706,8 +1719,8 @@ impl State {
         }
         let mut chars = 0;
         widest(&self.tree, self.tree.root, &mut chars);
-        let label_px = chars * self.renderer.cell_w;
-        (SIDEBAR_PAD_L + label_px).max(WBTN_W) + SIDEBAR_MARGIN
+        let label_px = chars.max(SIDEBAR_MIN_CHARS) * self.renderer.cell_w;
+        SIDEBAR_PAD_L + label_px + SIDEBAR_MARGIN
     }
 
     /// Grid size for the terminal area (window minus sidebar, header and —
@@ -1749,7 +1762,9 @@ impl State {
         if sw == 0 || x >= sw as f64 || y < HEADER_H as f64 {
             return None;
         }
-        let off = y as usize - HEADER_H;
+        // Map the click into content space by adding back the scroll offset, so
+        // hit-testing tracks the drawn (possibly scrolled) rows exactly.
+        let off = (y as usize - HEADER_H) + self.sidebar_scroll;
         let tops = sidebar_row_tops(rows, rh);
         // Last row whose top is at or above the click; reject clicks that land in
         // a blank spacer between group blocks.
@@ -1759,6 +1774,18 @@ impl State {
         }
         let row = rows.get(i)?;
         Some((row.id, row.is_group))
+    }
+
+    /// Largest sidebar scroll offset (logical px, a multiple of the row height)
+    /// that still leaves the last tree row reachable at the bottom of the pane.
+    /// `0` when the whole tree already fits, which disables sidebar scrolling.
+    fn sidebar_max_scroll(&self, rows: &[Row]) -> usize {
+        let rh = self.renderer.cell_h.max(1);
+        let (_, ph) = self.logical_size();
+        let tops = sidebar_row_tops(rows, rh);
+        let content_h = tops.last().map_or(0, |&t| t + rh);
+        let visible = ph.saturating_sub(HEADER_H);
+        content_h.saturating_sub(visible).div_ceil(rh) * rh
     }
 
     /// The link under the pointer, if the pointer is inside the shown
@@ -2228,6 +2255,39 @@ impl App {
         } else {
             term.scroll_display(Scroll::Delta(lines));
             drop(term);
+            st.request_redraw();
+        }
+    }
+
+    /// Wheel scrolling for the sidebar tree when the pointer is over it and the
+    /// tree is taller than the pane. `delta` is in text lines (same units as
+    /// [`Self::scroll`]); positive (wheel away from the user) reveals earlier
+    /// rows. Fractional touchpad input accumulates in `sidebar_scroll_acc` so a
+    /// whole row is scrolled once it adds up. The offset stays a multiple of the
+    /// row height, so rows never straddle the header. No scrollbar is drawn.
+    fn scroll_sidebar(&mut self, delta: f64) {
+        let Some(st) = self.state.as_mut() else { return };
+        let rh = st.renderer.cell_h.max(1);
+        let rows = st.tree.rows(st.selected);
+        let max = st.sidebar_max_scroll(&rows);
+        if max == 0 {
+            st.sidebar_scroll = 0;
+            st.sidebar_scroll_acc = 0.0;
+            return;
+        }
+        // Accumulate in rows: wheel-away (delta > 0) scrolls toward the top, so
+        // the offset decreases by `delta` rows.
+        st.sidebar_scroll_acc -= delta;
+        let steps = st.sidebar_scroll_acc.trunc() as i64;
+        if steps == 0 {
+            return;
+        }
+        st.sidebar_scroll_acc -= steps as f64;
+        let cur = (st.sidebar_scroll / rh) as i64;
+        let next = (cur + steps).clamp(0, (max / rh) as i64);
+        let scrolled = next as usize * rh;
+        if scrolled != st.sidebar_scroll {
+            st.sidebar_scroll = scrolled;
             st.request_redraw();
         }
     }
@@ -2853,6 +2913,8 @@ impl ApplicationHandler<UserEvent> for App {
             win_hover: None,
             header_hover: false,
             sidebar_hover: None,
+            sidebar_scroll: 0,
+            sidebar_scroll_acc: 0.0,
             link_cells: HashSet::new(),
         };
         self.state = Some(st);
@@ -3372,7 +3434,17 @@ impl ApplicationHandler<UserEvent> for App {
                         p.y / ch.max(1) as f64
                     }
                 };
-                self.scroll(lines);
+                // Over the sidebar column, the wheel scrolls the tree; anywhere
+                // else it scrolls the shown terminal's scrollback.
+                let over_sidebar = self.state.as_ref().is_some_and(|s| {
+                    let sw = s.sidebar_w();
+                    sw > 0 && s.mouse.0 < sw as f64
+                });
+                if over_sidebar {
+                    self.scroll_sidebar(lines);
+                } else {
+                    self.scroll(lines);
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {

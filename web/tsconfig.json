@@ -1,0 +1,26 @@
+{
+  // Type-checking only — Bun runs the .ts/.tsx directly, so this never emits.
+  // `bun run typecheck` (tsc --noEmit) is the gate.
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+
+    // Bun + browser: ESM, bundler resolution, import ".ts" extensions verbatim.
+    "module": "esnext",
+    "target": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "allowJs": true,
+
+    "jsx": "react-jsx",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "types": ["bun", "react"],
+
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["main.ts", "src", "protodatabase", "scripts"],
+  "exclude": ["node_modules"]
+}

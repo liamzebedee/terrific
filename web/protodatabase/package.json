@@ -1,0 +1,10 @@
+{
+  "name": "protodatabase",
+  "private": true,
+  "type": "module",
+  "description": "Prototype: protobuf messages as the single source of truth for a SQLite database.",
+  "scripts": {
+    "gen": "protoc --plugin=protoc-gen-es=../node_modules/.bin/protoc-gen-es --es_out=gen --es_opt=target=ts -I ../services/proto -I proto planner/v1/planner.proto db/v1/database.proto && bun codegen.ts",
+    "demo": "bun demo.ts"
+  }
+}

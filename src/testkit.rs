@@ -75,6 +75,8 @@ impl Harness {
             win_hover: None,
             header_hover: false,
             sidebar_hover: None,
+            sidebar_scroll: 0,
+            sidebar_scroll_acc: 0.0,
             link_cells: std::collections::HashSet::new(),
         };
         let dir = std::env::temp_dir().join(format!(

@@ -1,0 +1,18 @@
+// Item — the example domain table. A trivial owner-scoped record (id + name +
+// description) that demonstrates the full stack: proto model → DB table (see
+// models/database.proto) → RPC service (services/item.proto) → API impl
+// (src/api/services/item.ts) → typed client (src/rpc.ts) → page/card UI.
+//
+// Replace this with your own model(s) when starting a real project.
+
+syntax = "proto3";
+
+package app.v1;
+
+message Item {
+  string id = 1;          // PK — a UUIDv7 minted on create
+  int32 owner = 2;        // the User.id this row belongs to (owner-scoped)
+  string name = 3;
+  string description = 4;
+  double created_at = 5;  // unix millis (double keeps it a plain JS number)
+}

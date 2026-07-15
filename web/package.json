@@ -1,0 +1,28 @@
+{
+  "name": "app-template",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot main.ts",
+    "typecheck": "tsc --noEmit",
+    "gen": "bun run gen:proto && bun run gen:db",
+    "gen:proto": "cd src/proto && buf generate",
+    "gen:db": "bun protodatabase/cli.ts src/proto/models/database.proto --gen-dir src/proto/gen --schema-out src/proto/gen/schema.gen.sql --types-out src/proto/gen/schema.gen.ts --client-out src/proto/gen/client.gen.ts --open-name openAppDb --proto-path src/proto"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "^1.71.0",
+    "@bufbuild/protoc-gen-es": "^2.12.1",
+    "@types/bun": "latest",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.12.1",
+    "@connectrpc/connect": "^2.1.2",
+    "@connectrpc/connect-web": "^2.1.2",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  }
+}

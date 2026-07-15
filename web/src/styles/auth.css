@@ -1,0 +1,170 @@
+/* Login / register — a single centered card shown when logged out. */
+
+.auth {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 360px;
+  background: var(--panel, #fff);
+  border: 1px solid var(--border, #e2e2e2);
+  border-radius: 10px;
+  padding: 28px 26px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.06);
+}
+
+.auth-title {
+  margin: 0 0 4px;
+  font-size: 20px;
+  font-weight: 650;
+}
+
+.auth-sub {
+  margin: 0 0 20px;
+  font-size: 13px;
+  color: var(--muted, #666);
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.auth-field label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.auth-field input {
+  padding: 9px 11px;
+  font-size: 14px;
+  border: 1px solid var(--border, #d0d0d0);
+  border-radius: 7px;
+  background: var(--bg, #fff);
+}
+
+.auth-field input:focus {
+  outline: none;
+  border-color: var(--accent, #2b6cb0);
+}
+
+.auth-remember {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+.auth-remember input {
+  width: auto;
+  margin: 0;
+  cursor: pointer;
+}
+
+.auth-submit {
+  margin-top: 6px;
+  padding: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent, #2b6cb0);
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.auth-submit:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.auth-error {
+  padding: 8px 11px;
+  font-size: 13px;
+  color: #a12626;
+  background: #fdecec;
+  border: 1px solid #f5c6c6;
+  border-radius: 7px;
+}
+
+.auth-switch {
+  margin-top: 18px;
+  font-size: 13px;
+  text-align: center;
+}
+
+.auth-switch button {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent, #2b6cb0);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* Account section in Settings — who you are + log out. */
+.set-account {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.set-account-who {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.set-account-email {
+  font-weight: 400;
+  color: var(--muted, #666);
+}
+
+.btn-logout {
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #a12626;
+  background: #fff;
+  border: 1px solid #e0b4b4;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.btn-logout:hover {
+  background: #fdecec;
+}
+
+.set-changepw {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.set-changepw input {
+  padding: 7px 10px;
+  font-size: 13px;
+  border: 1px solid var(--border, #d0d0d0);
+  border-radius: 7px;
+  background: var(--bg, #fff);
+}
+
+.set-pw-ok {
+  font-size: 13px;
+  color: #2c6b36;
+}

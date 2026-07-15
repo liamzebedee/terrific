@@ -1,0 +1,106 @@
+/* App pages — the example Items page, its cards, and shared page chrome. Plain,
+   uncoloured proof-of-concept styling; restyle per project. */
+
+.page {
+  flex: 1;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.page-error {
+  padding: 8px 11px;
+  font-size: 13px;
+  color: #a12626;
+  background: #fdecec;
+  border: 1px solid #f5c6c6;
+  border-radius: 7px;
+}
+
+.page-empty {
+  color: #8a7c5c;
+  font-size: 14px;
+}
+
+/* Generic small button + inputs. */
+.btn {
+  height: 34px;
+  padding: 0 16px;
+  border: 1px solid #c8bf9e;
+  background: #5a4a2c;
+  color: #f3efe0;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.btn:disabled { opacity: 0.5; cursor: default; }
+
+.btn-mini {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid #c8bf9e;
+  background: #f6f1de;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+/* New-item form. */
+.item-new {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.item-new input {
+  height: 34px;
+  padding: 0 11px;
+  font-size: 14px;
+  border: 1px solid #c8bf9e;
+  border-radius: 6px;
+  background: #fff;
+}
+.item-new input:first-child { flex: 0 0 200px; }
+.item-new input:nth-child(2) { flex: 1; min-width: 200px; }
+
+/* Card grid + the example ItemCard. */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.card {
+  border: 1px solid #d8d0b6;
+  border-radius: 8px;
+  background: #fbf8ec;
+  padding: 12px 14px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.card-name {
+  font-weight: 600;
+  color: #2a1f10;
+}
+
+.card-desc {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: #6b5d40;
+}
+
+.card-del {
+  border: none;
+  background: none;
+  font-size: 18px;
+  line-height: 1;
+  color: #a12626;
+  cursor: pointer;
+  padding: 0 2px;
+}

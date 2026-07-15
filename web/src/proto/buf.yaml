@@ -1,0 +1,21 @@
+version: v2
+modules:
+  - path: .
+    # buf compiles every .proto here, including models/database.proto — protoc
+    # can't exclude a single file. That yields a dead second copy of the
+    # Database message; scripts/normalize-gen.ts drops it (the live one comes
+    # from protodatabase's gen:planner-db).
+lint:
+  use:
+    - STANDARD
+  # Files are organized by concern (models/, services/) under a single
+  # planner.v1 package, so the file path deliberately does not mirror the
+  # package, one package spans several directories, and the version suffix
+  # lives only in the package name.
+  except:
+    - PACKAGE_DIRECTORY_MATCH
+    - PACKAGE_VERSION_SUFFIX
+    - PACKAGE_SAME_DIRECTORY
+breaking:
+  use:
+    - WIRE_JSON

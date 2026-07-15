@@ -1,0 +1,291 @@
+/* Product landing page (src/pages/LandingPage.tsx). Warm-paper palette matching
+   the rest of the app. Fully responsive: a fluid single column that widens and
+   scales type up on larger viewports via clamp() + one mobile breakpoint. */
+
+.lp {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 20px 64px;
+  color: #2a1f10;
+}
+
+/* ---- top bar ---- */
+.lp-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 0;
+}
+.lp-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 700;
+  font-size: 1.15rem;
+  letter-spacing: 0.01em;
+  color: #5a4a2c;
+  text-decoration: none;
+}
+.lp-brand-mark { width: 26px; height: 26px; display: block; }
+
+/* ---- hero ---- */
+.lp-hero {
+  text-align: center;
+  padding: clamp(24px, 6vw, 56px) 0 clamp(20px, 4vw, 36px);
+}
+.lp-eyebrow {
+  margin: 0 0 14px;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: #8a7548;
+  font-weight: 600;
+}
+.lp-title {
+  margin: 0 auto;
+  max-width: 16ch;
+  font-size: clamp(2rem, 6.2vw, 3.5rem);
+  line-height: 1.08;
+  letter-spacing: -0.02em;
+  font-weight: 800;
+}
+.lp-title-accent { color: #5a4a2c; }
+.lp-sub {
+  margin: 20px auto 0;
+  max-width: 52ch;
+  font-size: clamp(1rem, 2.4vw, 1.18rem);
+  line-height: 1.55;
+  color: #4a3d28;
+}
+
+/* ---- CTA ---- */
+.lp-cta {
+  margin-top: 30px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+.lp-buy {
+  appearance: none;
+  border: 1px solid #46381f;
+  background: #5a4a2c;
+  color: #f6f1de;
+  font-weight: 700;
+  font-size: 1.05rem;
+  padding: 15px 30px;
+  border-radius: 10px;
+  cursor: pointer;
+  box-shadow: 0 2px 0 #46381f, 0 8px 22px rgba(74, 58, 32, 0.22);
+  transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.15s ease;
+}
+.lp-buy:hover:not(:disabled) { background: #4a3d24; transform: translateY(-1px); }
+.lp-buy:active:not(:disabled) { transform: translateY(1px); box-shadow: 0 1px 0 #46381f; }
+.lp-buy:disabled { opacity: 0.7; cursor: default; }
+.lp-buy--sm {
+  font-size: 0.9rem;
+  padding: 9px 18px;
+  border-radius: 8px;
+  box-shadow: 0 2px 0 #46381f;
+}
+
+.lp-platforms {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.9rem;
+  color: #8a7548;
+  font-weight: 600;
+}
+.lp-dot { width: 4px; height: 4px; border-radius: 50%; background: #c8bf9e; }
+
+/* ---- video ---- */
+.lp-videowrap { margin: 8px 0 clamp(36px, 6vw, 60px); }
+.lp-video {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid #d8d0b6;
+  background: #1c150b;
+  box-shadow: 0 18px 50px rgba(42, 31, 16, 0.22);
+  aspect-ratio: 16 / 10;
+}
+.lp-video-poster {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.lp-video.is-playing .lp-video-poster { filter: brightness(0.55); }
+.lp-play {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 78px;
+  height: 78px;
+  border-radius: 50%;
+  border: none;
+  display: grid;
+  place-items: center;
+  color: #2a1f10;
+  background: rgba(246, 241, 222, 0.94);
+  cursor: pointer;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  transition: transform 0.1s ease, background 0.15s ease;
+  padding-left: 4px;
+}
+.lp-play:hover { transform: scale(1.06); background: #fffaeb; }
+.lp-video-badge {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: max-content;
+  height: max-content;
+  color: #f6f1de;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+/* ---- features ---- */
+.lp-features {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+.lp-feature {
+  background: #f6f1de;
+  border: 1px solid #e3dcc4;
+  border-radius: 12px;
+  padding: 20px;
+}
+.lp-feature h3 {
+  margin: 0 0 8px;
+  font-size: 1.05rem;
+  color: #5a4a2c;
+}
+.lp-feature p {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: #4a3d28;
+}
+
+/* ---- footer ---- */
+.lp-footer {
+  margin-top: 44px;
+  padding-top: 18px;
+  border-top: 1px solid #e3dcc4;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  color: #8a7548;
+}
+
+/* ---- success view ---- */
+.lp--success { display: flex; justify-content: center; }
+.lp-success-card {
+  margin-top: clamp(28px, 8vw, 72px);
+  max-width: 560px;
+  width: 100%;
+  text-align: center;
+  background: #f6f1de;
+  border: 1px solid #e3dcc4;
+  border-radius: 16px;
+  padding: clamp(28px, 6vw, 44px);
+  box-shadow: 0 18px 50px rgba(42, 31, 16, 0.14);
+}
+.lp-check {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 18px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 1.6rem;
+  color: #f6f1de;
+  background: #3e7d3e;
+}
+.lp-success-card h1 {
+  margin: 0 0 12px;
+  font-size: clamp(1.4rem, 4.5vw, 1.9rem);
+  line-height: 1.2;
+}
+.lp-license {
+  margin: 22px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+}
+.lp-license-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: #8a7548;
+  font-weight: 600;
+}
+.lp-license code {
+  font-size: 1.15rem;
+  letter-spacing: 0.06em;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: #ece4c9;
+  border: 1px dashed #c8bf9e;
+  color: #2a1f10;
+}
+.lp-downloads {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 8px 0 18px;
+}
+.lp-download {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 14px;
+  border-radius: 10px;
+  text-decoration: none;
+  background: #5a4a2c;
+  color: #f6f1de;
+  transition: background 0.15s ease, transform 0.08s ease;
+}
+.lp-download:hover { background: #4a3d24; transform: translateY(-1px); }
+.lp-download-os { font-weight: 700; font-size: 1.05rem; }
+.lp-download-note { font-size: 0.78rem; opacity: 0.8; }
+.lp-download-file { font-size: 0.78rem; opacity: 0.65; font-family: ui-monospace, monospace; margin-top: 2px; }
+.lp-fineprint {
+  font-size: 0.8rem;
+  color: #8a7548;
+  margin: 4px 0 18px;
+  line-height: 1.5;
+}
+.lp-textbtn {
+  border: none;
+  background: none;
+  color: #5a4a2c;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.95rem;
+  padding: 6px;
+}
+.lp-textbtn:hover { text-decoration: underline; }
+
+/* ---- responsive ---- */
+@media (max-width: 720px) {
+  .lp-features { grid-template-columns: 1fr; }
+  .lp-video { aspect-ratio: 16 / 11; }
+  .lp-play { width: 62px; height: 62px; }
+}
+@media (max-width: 460px) {
+  .lp { padding: 0 16px 48px; }
+  .lp-downloads { grid-template-columns: 1fr; }
+  .lp-footer { justify-content: center; text-align: center; }
+  .lp-buy { width: 100%; }
+}

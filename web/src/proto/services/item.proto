@@ -1,0 +1,34 @@
+// ItemService — CRUD over the example Item table, scoped to the signed-in user.
+// The canonical example of an owner-scoped RPC service: every method requires a
+// session and only ever touches the caller's own rows. Copy this shape for your
+// own resources.
+
+syntax = "proto3";
+
+package app.v1;
+
+import "models/item.proto";
+
+message ListItemsRequest {}
+message ListItemsResponse {
+  repeated Item items = 1;
+}
+
+message CreateItemRequest {
+  string name = 1;
+  string description = 2;
+}
+message CreateItemResponse {
+  Item item = 1;
+}
+
+message DeleteItemRequest {
+  string id = 1;
+}
+message DeleteItemResponse {}
+
+service ItemService {
+  rpc ListItems(ListItemsRequest) returns (ListItemsResponse);
+  rpc CreateItem(CreateItemRequest) returns (CreateItemResponse);
+  rpc DeleteItem(DeleteItemRequest) returns (DeleteItemResponse);
+}
