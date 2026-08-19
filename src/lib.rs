@@ -1,4 +1,4 @@
-//! manyterm — a workspace-organized mini terminal emulator.
+//! termset — a workspace-organized mini terminal emulator.
 //! (crate `termset_cli`; binary `terms`.)
 //!
 //! Backend : `alacritty_terminal` (PTY + VT/ANSI state machine + parser thread)
@@ -16,6 +16,7 @@
 //!
 //! Run with: `cargo run --release`
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -492,6 +493,100 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
     }
 }
 
+fn encode_key_for_pty(mods: ModifiersState, key: &Key, text: Option<&str>) -> Option<Vec<u8>> {
+    let (ctrl, alt, shift) = (mods.control_key(), mods.alt_key(), mods.shift_key());
+    let plain_alt = alt && !ctrl && !shift;
+
+    // zsh's default emacs bindings know Meta-b / Meta-f for word navigation,
+    // but not every install binds xterm's modified-arrow CSI sequences.
+    if plain_alt {
+        match key {
+            Key::Named(NamedKey::ArrowLeft) => return Some(b"\x1bb".to_vec()),
+            Key::Named(NamedKey::ArrowRight) => return Some(b"\x1bf".to_vec()),
+            _ => {}
+        }
+    }
+
+    // xterm modifier parameter: 1 + shift + 2*alt + 4*ctrl.
+    let m = 1 + shift as u8 + 2 * alt as u8 + 4 * ctrl as u8;
+    let csi = |tail: &str| -> Vec<u8> {
+        if m > 1 {
+            format!("\x1b[1;{m}{tail}").into_bytes()
+        } else {
+            format!("\x1b[{tail}").into_bytes()
+        }
+    };
+    let tilde = |n: u8| -> Vec<u8> {
+        if m > 1 {
+            format!("\x1b[{n};{m}~").into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        }
+    };
+
+    Some(match key {
+        Key::Named(NamedKey::Enter) => vec![b'\r'],
+        Key::Named(NamedKey::Backspace) => {
+            if ctrl {
+                b"\x17".to_vec()
+            } else {
+                vec![0x7f]
+            }
+        }
+        Key::Named(NamedKey::Tab) => {
+            if shift {
+                b"\x1b[Z".to_vec()
+            } else {
+                vec![b'\t']
+            }
+        }
+        Key::Named(NamedKey::Escape) => vec![0x1b],
+        Key::Named(NamedKey::ArrowUp) => csi("A"),
+        Key::Named(NamedKey::ArrowDown) => csi("B"),
+        Key::Named(NamedKey::ArrowRight) => csi("C"),
+        Key::Named(NamedKey::ArrowLeft) => csi("D"),
+        Key::Named(NamedKey::Home) => csi("H"),
+        Key::Named(NamedKey::End) => csi("F"),
+        Key::Named(NamedKey::Delete) => tilde(3),
+        Key::Named(NamedKey::PageUp) => tilde(5),
+        Key::Named(NamedKey::PageDown) => tilde(6),
+        Key::Named(NamedKey::Space) => {
+            if ctrl {
+                vec![0]
+            } else {
+                vec![b' ']
+            }
+        }
+        Key::Character(c) if ctrl => {
+            let ch = c.chars().next()?;
+            if !ch.is_ascii() {
+                return None;
+            }
+            let b = (ch as u8).to_ascii_uppercase();
+            let ctl = match b {
+                b'@'..=b'_' => b & 0x1f,
+                b' ' => 0,
+                b'?' => 0x7f,
+                _ => return None,
+            };
+            if alt {
+                vec![0x1b, ctl]
+            } else {
+                vec![ctl]
+            }
+        }
+        _ => match text {
+            Some(t) if alt => {
+                let mut v = vec![0x1b];
+                v.extend_from_slice(t.as_bytes());
+                v
+            }
+            Some(t) => t.as_bytes().to_vec(),
+            None => return None,
+        },
+    })
+}
+
 /// Observe what a PTY's shell is doing (is a command in the foreground, and
 /// what). Best-effort and OS-abstracted (see [`sys`]); any failure degrades to
 /// "nothing observed" (`Obs::default`), which the planner treats as "not
@@ -812,13 +907,10 @@ impl Renderer {
             load(UBUNTU_MONO_ITALIC),
             load(UBUNTU_MONO_BOLD_ITALIC),
         ];
-        // The fallback chain (embedded emoji + OS faces for CJK/rare symbols) is
-        // *not* loaded here: parsing those fonts — and the `fc-match` subprocesses
-        // that locate the OS ones — cost ~100ms+ and would block the window from
-        // appearing at all. They're only ever consulted lazily by `glyph()` for a
-        // char the primary family lacks, so `load_fallback_fonts()` runs on a
-        // worker thread and the result is swapped in via `UserEvent::FallbackFonts`.
-        let fallbacks: Vec<fontdue::Font> = Vec::new();
+        // Keep the embedded fallback loaded from the first frame so common
+        // prompt symbols (`➜`, emoji) don't render as blanks while the slower
+        // OS font discovery runs on a worker thread.
+        let fallbacks = embedded_fallback_fonts();
 
         let lm = styles[0]
             .horizontal_line_metrics(FONT_PX)
@@ -901,15 +993,19 @@ const NOTO_EMOJI: &[u8] = include_bytes!("../assets/fonts/NotoEmoji-Regular.ttf"
 
 /// OS-specific fallback font paths for glyph coverage beyond the primary face.
 /// Pure list of candidate paths; non-existent ones are skipped by `load_fonts`.
+fn embedded_fallback_fonts() -> Vec<fontdue::Font> {
+    fontdue::Font::from_bytes(NOTO_EMOJI.to_vec(), fontdue::FontSettings::default())
+        .ok()
+        .into_iter()
+        .collect()
+}
+
 /// Build the lazy fallback chain: embedded Noto Emoji (monochrome) first so
 /// emoji render identically on every OS, then OS faces (`fallback_font_paths`)
 /// for anything the primary family lacks (CJK, rare symbols). Runs off the
 /// critical path on a worker thread — see `Renderer::new`.
 fn load_fallback_fonts() -> Vec<fontdue::Font> {
-    let mut fallbacks: Vec<fontdue::Font> = Vec::new();
-    if let Ok(f) = fontdue::Font::from_bytes(NOTO_EMOJI.to_vec(), fontdue::FontSettings::default()) {
-        fallbacks.push(f);
-    }
+    let mut fallbacks = embedded_fallback_fonts();
     fallbacks.extend(
         fallback_font_paths()
             .iter()
@@ -1231,6 +1327,20 @@ struct State {
     /// came out half-size on a 2× display) and screenshots are
     /// DPI-independent.
     fb: Vec<u32>,
+    /// True after `request_redraw` queues a winit redraw and false once that
+    /// frame is actually being painted. PTY output often sends several wakeups
+    /// for one visible prompt update; coalescing avoids redundant full-frame
+    /// composes.
+    redraw_pending: Cell<bool>,
+    /// Cached physical-x -> logical-x map for Retina/chrome upscaling.
+    /// Rebuilt only when physical width, logical width, or scale changes.
+    upscale_cols: Vec<u32>,
+    upscale_cols_key: (usize, usize, u64),
+    /// During HiDPI physical composition, the terminal is redrawn directly at
+    /// device resolution after the logical chrome layer is upscaled. Skipping
+    /// the logical terminal glyph pass avoids doing the same expensive text
+    /// work twice.
+    skip_logical_terminal: bool,
     /// Physical pixel size of the window (or the harness's virtual target).
     phys: (usize, usize),
     /// Device pixel ratio (winit `scale_factor`). 1.0 headless / non-HiDPI.
@@ -1330,6 +1440,9 @@ impl State {
     /// renders explicitly via `paint`).
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
+            if self.redraw_pending.replace(true) {
+                return;
+            }
             w.request_redraw();
         }
     }
@@ -1374,26 +1487,28 @@ impl State {
         // the scrollbar can always be drawn in its gutter.
         let mut scroll_state = (0usize, 0usize, 1usize); // (offset, history, screen)
         if let Some(node) = shown {
-            // Render the grid at logical (1×) size into `buf`. The GUI redraw
-            // re-renders it crisply at device resolution on Retina; the test
-            // harness reads this buffer directly.
             let lines = self.sessions[&node].tab.size.lines as i32;
             let term = self.sessions[&node].tab.term.lock();
-            draw_terminal_cells(
-                &mut buf,
-                pw,
-                ph,
-                &mut self.renderer,
-                &term,
-                lines,
-                sw,
-                HEADER_H,
-                tcr,
-                cw,
-                ch,
-                FONT_PX,
-                &self.link_cells,
-            );
+            if !self.skip_logical_terminal {
+                // Render the grid at logical (1×) size into `buf`. The GUI
+                // redraw re-renders it crisply at device resolution on Retina;
+                // the test harness reads this buffer directly.
+                draw_terminal_cells(
+                    &mut buf,
+                    pw,
+                    ph,
+                    &mut self.renderer,
+                    &term,
+                    lines,
+                    sw,
+                    HEADER_H,
+                    tcr,
+                    cw,
+                    ch,
+                    FONT_PX,
+                    &self.link_cells,
+                );
+            }
             let grid = term.grid();
             scroll_state = (grid.display_offset(), grid.history_size(), grid.screen_lines());
             drop(term);
@@ -1531,26 +1646,17 @@ impl State {
         let sy = sx;
         let origin_x = (self.sidebar_w() as f64 * sx).round() as usize;
         let origin_y = (HEADER_H as f64 * sy).round() as usize;
-        // Full viewport (incl. the scrollbar gutter) vs. the cell grid (short of
-        // it). Backdrop refills the whole viewport; cells clip to the content.
-        let view_right = ((term_right(lw, self.inspector) as f64 * sx).round() as usize).min(pw);
+        // Cell grid, short of the scrollbar gutter. The logical layer already
+        // carries the full terminal viewport backdrop.
         let clip_right = ((term_content_right(lw, self.inspector) as f64 * sx).round() as usize).min(pw);
         let cell_w = ((self.renderer.cell_w as f64 * sx).round() as usize).max(1);
         let cell_h = ((self.renderer.cell_h as f64 * sy).round() as usize).max(1);
         let font_px = FONT_PX * sy as f32;
         let lines = self.sessions[&node].tab.size.lines as i32;
-        // Re-lay the backdrop image in the terminal viewport so the crisp pass
-        // leaves no antialiasing ghosts behind and the image stays under the
-        // text; per-cell backgrounds are repainted by `draw_terminal_cells`.
-        fill_backdrop(
-            buf,
-            pw,
-            ph,
-            origin_x,
-            origin_y,
-            view_right.saturating_sub(origin_x),
-            ph.saturating_sub(origin_y),
-        );
+        // The logical layer already contains the terminal backdrop. Since
+        // `compose_physical` skips the logical terminal text pass on HiDPI,
+        // there are no upscaled glyph ghosts to erase here; per-cell terminal
+        // backgrounds are still repainted by `draw_terminal_cells`.
         let term = self.sessions[&node].tab.term.lock();
         draw_terminal_cells(
             buf,
@@ -1608,7 +1714,9 @@ impl State {
         // Capture chrome text instead of drawing it into the logical frame,
         // so it doesn't get upscaled-and-chunky — it's replayed crisply below.
         self.renderer.text_log = if scaled { Some(Vec::new()) } else { None };
+        self.skip_logical_terminal = scaled;
         self.paint();
+        self.skip_logical_terminal = false;
         if !scaled {
             // Non-HiDPI: the logical frame already is the physical frame.
             buf.copy_from_slice(&self.fb);
@@ -1622,13 +1730,39 @@ impl State {
         // `logical_size` rounds up, so `px/scale < lw` always holds — full
         // coverage, no clamp-induced edge artefact.
         let s = self.scale.max(1.0);
+        // Same nearest-neighbour mapping as ever — `dst[px] = src[px / scale]` —
+        // just without paying for it per pixel. A resize frame has ~16ms to reach
+        // the screen before the window is a step bigger than the image in it, and
+        // at maximized Retina sizes this loop is 7M iterations, so the two obvious
+        // redundancies are worth removing:
+        //
+        // - the column index only depends on `px`, so compute it once into a LUT
+        //   instead of doing a float divide per pixel;
+        // - upscaling repeats source *rows* (every row is drawn `scale` times), so
+        //   emit a repeat as a memcpy of the row we just wrote rather than
+        //   re-sampling it column by column.
+        let cols_key = (pw, lw, s.to_bits());
+        if self.upscale_cols_key != cols_key {
+            self.upscale_cols.clear();
+            self.upscale_cols.extend(
+                (0..pw).map(|px| ((px as f64 / s) as usize).min(lw - 1) as u32),
+            );
+            self.upscale_cols_key = cols_key;
+        }
+        let cols = &self.upscale_cols;
+        let (mut prev_ly, mut prev_drow) = (usize::MAX, 0usize);
         for py in 0..ph {
             let ly = ((py as f64 / s) as usize).min(lh - 1);
-            let (srow, drow) = (ly * lw, py * pw);
-            for px in 0..pw {
-                let lx = ((px as f64 / s) as usize).min(lw - 1);
-                buf[drow + px] = self.fb[srow + lx];
+            let drow = py * pw;
+            if ly == prev_ly {
+                buf.copy_within(prev_drow..prev_drow + pw, drow);
+                continue;
             }
+            let src = &self.fb[ly * lw..ly * lw + lw];
+            for (d, &c) in buf[drow..drow + pw].iter_mut().zip(cols.iter()) {
+                *d = src[c as usize];
+            }
+            (prev_ly, prev_drow) = (ly, drow);
         }
         // Now render text at true device resolution over the upscaled shapes:
         // the terminal grid first, then the captured chrome strings.
@@ -1690,6 +1824,20 @@ impl State {
             drop(term);
             self.request_redraw();
         }
+    }
+
+    fn send_input(&mut self, bytes: Vec<u8>) {
+        let Some(node) = self.shown() else { return };
+        // Typing snaps back to the prompt if we were scrolled up, like xterm.
+        let mut term = self.sessions[&node].tab.term.lock();
+        if term.grid().display_offset() != 0 {
+            term.scroll_display(Scroll::Bottom);
+            drop(term);
+            self.request_redraw();
+        } else {
+            drop(term);
+        }
+        self.sessions[&node].tab.write(bytes);
     }
 
     /// Logical width of the sidebar pane: `0` when hidden, otherwise the left
@@ -2661,6 +2809,7 @@ impl App {
         let (Some(st), Some(surface)) = (state.as_mut(), surface.as_mut()) else {
             return;
         };
+        st.redraw_pending.set(false);
         st.sync_metrics();
         let (pw, ph) = st.phys;
         let (Some(w), Some(h)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) else {
@@ -2685,19 +2834,9 @@ impl App {
         buf.present().unwrap();
     }
 
-    fn send(&self, bytes: Vec<u8>) {
-        let Some(st) = self.state.as_ref() else { return };
-        let Some(node) = st.shown() else { return };
-        // Typing snaps back to the prompt if we were scrolled up, like xterm.
-        let mut term = st.sessions[&node].tab.term.lock();
-        if term.grid().display_offset() != 0 {
-            term.scroll_display(Scroll::Bottom);
-            drop(term);
-            st.request_redraw();
-        } else {
-            drop(term);
-        }
-        self.send_to(node, bytes);
+    fn send(&mut self, bytes: Vec<u8>) {
+        let Some(st) = self.state.as_mut() else { return };
+        st.send_input(bytes);
     }
 
     fn copy_to_clipboard(&mut self) {
@@ -2804,6 +2943,67 @@ fn mark_window_opaque(window: &Window) {
     let _ = conn.get_input_focus().map(|c| c.reply());
 }
 
+/// macOS counterpart to the X11 `background_pixel` fix above: make the strip a
+/// growing window exposes ahead of our next frame the theme background, not black.
+///
+/// AppKit sizes the window ahead of us. A zoom (double-click the title bar) hands
+/// us ~22 `Resized` steps over ~360ms and interpolates the frame between them
+/// server-side; a live drag steps it just as fast. Our frame takes single-digit
+/// milliseconds to compose at Retina sizes, so for a moment after each step the
+/// window is bigger than the image sitting in softbuffer's `CALayer`. That layer
+/// pins its contents top-left at natural size (`kCAGravityTopLeft`) and leaves the
+/// remainder *uncovered* — and what shows through is black. That's the "it doesn't
+/// redraw, it just goes black" during a resize.
+///
+/// A `CALayer` fills its bounds with `backgroundColor` underneath its contents, so
+/// colouring it `BG` turns that transient strip into a flat band of the app's own
+/// background — the same thing the X11 path buys with `background_pixel(BG)`, and
+/// invisible against the chrome in practice.
+///
+/// Deliberately *not* `kCAGravityResize`: stretching the layer would scale the
+/// stale frame to fill the window instead, which does hide the band, but it also
+/// rubber-bands all the text for the length of the animation. A steady band beats
+/// wobbling glyphs.
+///
+/// Best-effort: if the layer isn't where we expect, we leave the default.
+#[cfg(target_os = "macos")]
+fn back_layer_with_theme_bg(window: &Window) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_core_graphics::{CGColor, CGColorSpace};
+    use objc2_quartz_core::CALayer;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(RawWindowHandle::AppKit(h)) = window.window_handle().map(|h| h.as_raw()) else {
+        return;
+    };
+    // SAFETY: winit hands us a live `NSView` for the window we just created, and we
+    // only touch it here on the main thread (`resumed` runs on the event loop).
+    let view: &AnyObject = unsafe { &*(h.ns_view.as_ptr() as *const AnyObject) };
+    let root: Option<objc2::rc::Retained<CALayer>> = unsafe { msg_send![view, layer] };
+    let Some(root) = root else { return };
+    // Device RGB, matching the colour space softbuffer builds its `CGImage` in —
+    // generic RGB would land the band a shade off the pixels it abuts, which is a
+    // seam you can see. Same space, same bytes, no seam.
+    let c = |shift: u32| ((BG >> shift) & 0xff) as f64 / 255.0;
+    let comps = [c(16), c(8), c(0), 1.0];
+    let space = CGColorSpace::new_device_rgb();
+    // SAFETY: `comps` is a live 4-element buffer, matching device RGB's component
+    // count (3 + alpha), and `new` only reads it for the duration of the call.
+    let Some(bg) = (unsafe { CGColor::new(space.as_deref(), comps.as_ptr()) }) else {
+        return;
+    };
+    // softbuffer renders into a sublayer of the view's root layer, not the root
+    // itself. Colour both: the sublayer is what the resize exposes, and the root
+    // covers the gap if softbuffer ever changes where it draws.
+    root.setBackgroundColor(Some(&bg));
+    if let Some(subs) = unsafe { root.sublayers() } {
+        for layer in subs {
+            layer.setBackgroundColor(Some(&bg));
+        }
+    }
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
@@ -2858,6 +3058,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let ctx = softbuffer::Context::new(window.clone()).unwrap();
         self.surface = Some(softbuffer::Surface::new(&ctx, window.clone()).unwrap());
+        // Only now does softbuffer's layer exist to be configured.
+        #[cfg(target_os = "macos")]
+        back_layer_with_theme_bg(&window);
 
         let home = home_dir();
         let mut ws_text = std::fs::read_to_string(&self.ws_path).unwrap_or_default();
@@ -2888,6 +3091,10 @@ impl ApplicationHandler<UserEvent> for App {
             scale: window.scale_factor().max(1.0),
             window: Some(window),
             fb: Vec::new(),
+            redraw_pending: Cell::new(false),
+            upscale_cols: Vec::new(),
+            upscale_cols_key: (0, 0, 0),
+            skip_logical_terminal: false,
             renderer,
             selected: tree
                 .first_leaf(tree.root)
@@ -3496,69 +3703,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if kmods.super_key() {
                     return;
                 }
-                let mods = kmods;
-                let (ctrl, alt, shift) = (mods.control_key(), mods.alt_key(), mods.shift_key());
-                // xterm modifier parameter: 1 + shift + 2*alt + 4*ctrl.
-                let m = 1 + shift as u8 + 2 * alt as u8 + 4 * ctrl as u8;
-                let csi = |tail: &str| -> Vec<u8> {
-                    if m > 1 {
-                        format!("\x1b[1;{m}{tail}").into_bytes()
-                    } else {
-                        format!("\x1b[{tail}").into_bytes()
-                    }
-                };
-                let tilde = |n: u8| -> Vec<u8> {
-                    if m > 1 {
-                        format!("\x1b[{n};{m}~").into_bytes()
-                    } else {
-                        format!("\x1b[{n}~").into_bytes()
-                    }
-                };
-                let bytes: Vec<u8> = match &event.logical_key {
-                    Key::Named(NamedKey::Enter) => vec![b'\r'],
-                    Key::Named(NamedKey::Backspace) => {
-                        if ctrl { b"\x17".to_vec() } else { vec![0x7f] }
-                    }
-                    Key::Named(NamedKey::Tab) => {
-                        if shift { b"\x1b[Z".to_vec() } else { vec![b'\t'] }
-                    }
-                    Key::Named(NamedKey::Escape) => vec![0x1b],
-                    Key::Named(NamedKey::ArrowUp) => csi("A"),
-                    Key::Named(NamedKey::ArrowDown) => csi("B"),
-                    Key::Named(NamedKey::ArrowRight) => csi("C"),
-                    Key::Named(NamedKey::ArrowLeft) => csi("D"),
-                    Key::Named(NamedKey::Home) => csi("H"),
-                    Key::Named(NamedKey::End) => csi("F"),
-                    Key::Named(NamedKey::Delete) => tilde(3),
-                    Key::Named(NamedKey::PageUp) => tilde(5),
-                    Key::Named(NamedKey::PageDown) => tilde(6),
-                    Key::Named(NamedKey::Space) => {
-                        if ctrl { vec![0] } else { vec![b' '] }
-                    }
-                    Key::Character(c) if ctrl => match c.chars().next() {
-                        Some(ch) if ch.is_ascii() => {
-                            let b = (ch as u8).to_ascii_uppercase();
-                            let ctl = match b {
-                                b'@'..=b'_' => b & 0x1f,
-                                b' ' => 0,
-                                b'?' => 0x7f,
-                                _ => return,
-                            };
-                            if alt { vec![0x1b, ctl] } else { vec![ctl] }
-                        }
-                        _ => return,
-                    },
-                    _ => match event.text {
-                        Some(ref t) if alt => {
-                            let mut v = vec![0x1b];
-                            v.extend_from_slice(t.as_bytes());
-                            v
-                        }
-                        Some(ref t) => t.as_bytes().to_vec(),
-                        None => return,
-                    },
-                };
-                self.send(bytes);
+                if let Some(bytes) =
+                    encode_key_for_pty(kmods, &event.logical_key, event.text.as_deref())
+                {
+                    self.send(bytes);
+                }
             }
             _ => {}
         }
@@ -4002,6 +4151,368 @@ groups:
     }
 
     #[test]
+    fn embedded_fallback_renders_prompt_arrow_immediately() {
+        let mut r = Renderer::new();
+        let g = r.glyph('➜', FontStyle::Regular, FONT_PX);
+        assert!(g.w > 0 && g.h > 0, "prompt arrow must not wait for async OS fallbacks");
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run with `cargo test bench_enter_key_input_no_render -- --ignored --nocapture`"]
+    fn bench_enter_key_input_no_render() {
+        let tree = parse_workspace(
+            r#"
+groups:
+  - name: bench
+    sessions:
+      - name: shell
+        dir: .
+"#,
+            &home_dir(),
+        );
+        let selected = tree.first_leaf(tree.root).unwrap();
+        let size = TermSize { cols: 100, lines: 30 };
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &size,
+            Listener::Null,
+        )));
+        let mut state = State {
+            window: None,
+            fb: Vec::new(),
+            redraw_pending: Cell::new(false),
+            upscale_cols: Vec::new(),
+            upscale_cols_key: (0, 0, 0),
+            skip_logical_terminal: false,
+            phys: (1000, 720),
+            scale: 1.0,
+            renderer: Renderer::new(),
+            tree,
+            sessions: HashMap::new(),
+            id_of: HashMap::new(),
+            selected,
+            config_node: None,
+            next_id: 0,
+            ctx: None,
+            clipboard: None,
+            mouse: (0.0, 0.0),
+            selecting: false,
+            last_click: None,
+            mods: ModifiersState::empty(),
+            inspector: false,
+            sidebar_visible: true,
+            focus: None,
+            caret: 0,
+            scroll_acc: 0.0,
+            sbar_drag: None,
+            cursor: CursorIcon::Default,
+            win_hover: None,
+            header_hover: false,
+            sidebar_hover: None,
+            sidebar_scroll: 0,
+            sidebar_scroll_acc: 0.0,
+            link_cells: HashSet::new(),
+        };
+        state.sessions.insert(
+            selected,
+            Session {
+                tab: Tab {
+                    term,
+                    io: Io::Null,
+                    size,
+                    title: "bench".to_string(),
+                },
+                shell_pid: 0,
+            },
+        );
+
+        let iters = 100_000usize;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            state.send_input(std::hint::black_box(vec![b'\r']));
+        }
+        let elapsed = start.elapsed();
+        let ns_per = elapsed.as_nanos() as f64 / iters as f64;
+        eprintln!(
+            "bench_enter_key_input_no_render: {iters} enters in {:?} ({ns_per:.1} ns/enter, {:.0} enters/s)",
+            elapsed,
+            1_000_000_000.0 / ns_per
+        );
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run with `cargo test bench_enter_key_pty_enqueue_no_render -- --ignored --nocapture`"]
+    fn bench_enter_key_pty_enqueue_no_render() {
+        let size = TermSize { cols: 100, lines: 30 };
+        let window_size = WindowSize {
+            num_cols: size.cols as u16,
+            num_lines: size.lines as u16,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &size,
+            Listener::Null,
+        )));
+        let pty = tty::new(
+            &PtyOptions {
+                env: HashMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                ..PtyOptions::default()
+            },
+            window_size,
+            0,
+        )
+        .expect("spawn pty");
+        let pty_loop =
+            PtyEventLoop::new(term, Listener::Null, pty, false, false).expect("create pty loop");
+        let tx = pty_loop.channel();
+        pty_loop.spawn();
+
+        let iters = 100_000usize;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            tx.send(Msg::Input(std::hint::black_box(vec![b'\r']).into()))
+                .expect("send enter");
+        }
+        let elapsed = start.elapsed();
+        let ns_per = elapsed.as_nanos() as f64 / iters as f64;
+        eprintln!(
+            "bench_enter_key_pty_enqueue_no_render: {iters} enters in {:?} ({ns_per:.1} ns/enter, {:.0} enters/s)",
+            elapsed,
+            1_000_000_000.0 / ns_per
+        );
+        let _ = tx.send(Msg::Shutdown);
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run with `cargo test --release bench_terminal_output_parse_no_render -- --ignored --nocapture`"]
+    fn bench_terminal_output_parse_no_render() {
+        let size = TermSize { cols: 120, lines: 40 };
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &size,
+            Listener::Null,
+        )));
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        let mut chunk = String::new();
+        for i in 0..200 {
+            chunk.push_str(&format!("➜  Music parse benchmark command output {i}\r\n"));
+        }
+        let bytes = chunk.as_bytes();
+
+        let iters = 1_000usize;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut guard = term.lock();
+            parser.advance(&mut *guard, std::hint::black_box(bytes));
+        }
+        let elapsed = start.elapsed();
+        let bytes_total = bytes.len() * iters;
+        let ns_per_byte = elapsed.as_nanos() as f64 / bytes_total as f64;
+        eprintln!(
+            "bench_terminal_output_parse_no_render: {} bytes in {:?} ({ns_per_byte:.2} ns/byte, {:.1} MiB/s)",
+            bytes_total,
+            elapsed,
+            bytes_total as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+        );
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run with `cargo test --release bench_compose_prompt_frame -- --ignored --nocapture`"]
+    fn bench_compose_prompt_frame() {
+        let tree = parse_workspace(
+            r#"
+groups:
+  - name: bench
+    sessions:
+      - name: shell
+        dir: .
+"#,
+            &home_dir(),
+        );
+        let selected = tree.first_leaf(tree.root).unwrap();
+        let size = TermSize { cols: 120, lines: 40 };
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &size,
+            Listener::Null,
+        )));
+        {
+            let mut parser = alacritty_terminal::vte::ansi::Processor::<
+                alacritty_terminal::vte::ansi::StdSyncHandler,
+            >::new();
+            let mut guard = term.lock();
+            let mut text = String::new();
+            for i in 0..size.lines {
+                text.push_str(&format!("➜  Music echo frame benchmark line {i}\r\n"));
+            }
+            parser.advance(&mut *guard, text.as_bytes());
+        }
+        let mut state = State {
+            window: None,
+            fb: Vec::new(),
+            redraw_pending: Cell::new(false),
+            upscale_cols: Vec::new(),
+            upscale_cols_key: (0, 0, 0),
+            skip_logical_terminal: false,
+            phys: (2400, 1600),
+            scale: 2.0,
+            renderer: Renderer::new(),
+            tree,
+            sessions: HashMap::new(),
+            id_of: HashMap::new(),
+            selected,
+            config_node: None,
+            next_id: 0,
+            ctx: None,
+            clipboard: None,
+            mouse: (0.0, 0.0),
+            selecting: false,
+            last_click: None,
+            mods: ModifiersState::empty(),
+            inspector: false,
+            sidebar_visible: true,
+            focus: None,
+            caret: 0,
+            scroll_acc: 0.0,
+            sbar_drag: None,
+            cursor: CursorIcon::Default,
+            win_hover: None,
+            header_hover: false,
+            sidebar_hover: None,
+            sidebar_scroll: 0,
+            sidebar_scroll_acc: 0.0,
+            link_cells: HashSet::new(),
+        };
+        state.sessions.insert(
+            selected,
+            Session {
+                tab: Tab {
+                    term,
+                    io: Io::Null,
+                    size,
+                    title: "bench".to_string(),
+                },
+                shell_pid: 0,
+            },
+        );
+        let mut buf = vec![0; state.phys.0 * state.phys.1];
+        state.compose_physical(&mut buf);
+
+        let iters = 60usize;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            state.compose_physical(std::hint::black_box(&mut buf));
+        }
+        let elapsed = start.elapsed();
+        let ms_per = elapsed.as_secs_f64() * 1000.0 / iters as f64;
+        eprintln!(
+            "bench_compose_prompt_frame: {iters} Retina frames in {:?} ({ms_per:.3} ms/frame, {:.1} fps)",
+            elapsed,
+            1000.0 / ms_per
+        );
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark; run with `cargo test --release bench_paint_prompt_frame -- --ignored --nocapture`"]
+    fn bench_paint_prompt_frame() {
+        let tree = parse_workspace(
+            r#"
+groups:
+  - name: bench
+    sessions:
+      - name: shell
+        dir: .
+"#,
+            &home_dir(),
+        );
+        let selected = tree.first_leaf(tree.root).unwrap();
+        let size = TermSize { cols: 120, lines: 40 };
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &size,
+            Listener::Null,
+        )));
+        {
+            let mut parser = alacritty_terminal::vte::ansi::Processor::<
+                alacritty_terminal::vte::ansi::StdSyncHandler,
+            >::new();
+            let mut guard = term.lock();
+            let mut text = String::new();
+            for i in 0..size.lines {
+                text.push_str(&format!("➜  Music echo logical benchmark line {i}\r\n"));
+            }
+            parser.advance(&mut *guard, text.as_bytes());
+        }
+        let mut state = State {
+            window: None,
+            fb: Vec::new(),
+            redraw_pending: Cell::new(false),
+            upscale_cols: Vec::new(),
+            upscale_cols_key: (0, 0, 0),
+            skip_logical_terminal: false,
+            phys: (1200, 800),
+            scale: 1.0,
+            renderer: Renderer::new(),
+            tree,
+            sessions: HashMap::new(),
+            id_of: HashMap::new(),
+            selected,
+            config_node: None,
+            next_id: 0,
+            ctx: None,
+            clipboard: None,
+            mouse: (0.0, 0.0),
+            selecting: false,
+            last_click: None,
+            mods: ModifiersState::empty(),
+            inspector: false,
+            sidebar_visible: true,
+            focus: None,
+            caret: 0,
+            scroll_acc: 0.0,
+            sbar_drag: None,
+            cursor: CursorIcon::Default,
+            win_hover: None,
+            header_hover: false,
+            sidebar_hover: None,
+            sidebar_scroll: 0,
+            sidebar_scroll_acc: 0.0,
+            link_cells: HashSet::new(),
+        };
+        state.sessions.insert(
+            selected,
+            Session {
+                tab: Tab {
+                    term,
+                    io: Io::Null,
+                    size,
+                    title: "bench".to_string(),
+                },
+                shell_pid: 0,
+            },
+        );
+        state.paint();
+
+        let iters = 120usize;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            state.paint();
+            std::hint::black_box(&state.fb);
+        }
+        let elapsed = start.elapsed();
+        let ms_per = elapsed.as_secs_f64() * 1000.0 / iters as f64;
+        eprintln!(
+            "bench_paint_prompt_frame: {iters} logical frames in {:?} ({ms_per:.3} ms/frame, {:.1} fps)",
+            elapsed,
+            1000.0 / ms_per
+        );
+    }
+
+    #[test]
     fn shortcuts_map_per_platform() {
         let c = Key::Character("c".into());
         let dot = Key::Character(".".into());
@@ -4036,5 +4547,39 @@ groups:
             assert_eq!(match_shortcut(ctrl_shift, &lt), Some(Shortcut::EditLayout));
             assert_eq!(match_shortcut(cmd, &c), None);
         }
+    }
+
+    #[test]
+    fn pty_key_encoding_maps_plain_alt_arrows_to_shell_meta_words() {
+        let alt = ModifiersState::ALT;
+        let ctrl_alt = ModifiersState::CONTROL | ModifiersState::ALT;
+        let left = Key::Named(NamedKey::ArrowLeft);
+        let right = Key::Named(NamedKey::ArrowRight);
+
+        assert_eq!(
+            encode_key_for_pty(ModifiersState::empty(), &left, None).as_deref(),
+            Some(b"\x1b[D".as_slice())
+        );
+        assert_eq!(
+            encode_key_for_pty(ModifiersState::empty(), &right, None).as_deref(),
+            Some(b"\x1b[C".as_slice())
+        );
+
+        // Plain Alt+Left/Right should work in stock zsh by sending Meta-b/f,
+        // the same bindings as Alt+b and Alt+f.
+        assert_eq!(
+            encode_key_for_pty(alt, &left, None).as_deref(),
+            Some(b"\x1bb".as_slice())
+        );
+        assert_eq!(
+            encode_key_for_pty(alt, &right, None).as_deref(),
+            Some(b"\x1bf".as_slice())
+        );
+
+        // Additional modifiers keep the xterm modified-arrow form for TUI apps.
+        assert_eq!(
+            encode_key_for_pty(ctrl_alt, &left, None).as_deref(),
+            Some(b"\x1b[1;7D".as_slice())
+        );
     }
 }

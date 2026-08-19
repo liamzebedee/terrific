@@ -1184,4 +1184,3 @@ pub(crate) fn blend(fg: u32, bg: u32, a: u32) -> u32 {
     };
     mix(16) << 16 | mix(8) << 8 | mix(0)
 }
-
