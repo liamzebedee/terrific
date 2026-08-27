@@ -715,6 +715,10 @@ struct Renderer {
     /// device resolution after the shape layer is upscaled — the same Retina
     /// fix the terminal grid already gets. `None` = draw immediately (headless).
     text_log: Option<Vec<TextCmd>>,
+    /// Index of the first deferred text command belonging to a top-level
+    /// overlay. Base chrome text before this index must render below the
+    /// overlay; labels after it render above the restored overlay shape.
+    overlay_text_start: Option<usize>,
 }
 
 /// A deferred chrome-text draw, captured in logical coordinates.
@@ -757,6 +761,7 @@ impl Renderer {
             cell_h: cell_h.max(1),
             cache: HashMap::new(),
             text_log: None,
+            overlay_text_start: None,
         }
     }
 
@@ -1246,6 +1251,13 @@ fn terminal_ctx_actions() -> Vec<CtxAction> {
     ]
 }
 
+fn terminal_ctx_enabled(items: &[CtxAction], search_target: Option<&str>) -> Vec<bool> {
+    items
+        .iter()
+        .map(|action| *action != CtxAction::SearchGoogle || search_target.is_some())
+        .collect()
+}
+
 fn ctx_sep_count(items: &[CtxAction]) -> usize {
     items
         .windows(2)
@@ -1622,6 +1634,7 @@ impl State {
 
         // --- context menu ---------------------------------------------------
         if let Some(m) = &self.ctx {
+            self.renderer.overlay_text_start = self.renderer.text_log.as_ref().map(Vec::len);
             let hov = ctx_item_at(m, self.mouse.0, self.mouse.1);
             let labels: Vec<&str> = m.items.iter().map(|a| a.label()).collect();
             let seps = m.seps();
@@ -1741,6 +1754,39 @@ impl State {
         );
     }
 
+    /// Restore an opaque logical overlay after the HiDPI terminal-text pass.
+    ///
+    /// The terminal is deliberately redrawn after the upscaled shape layer so
+    /// its glyphs stay sharp. Popup menus live above the terminal, though, so
+    /// that redraw must not punch terminal cells through their background. The
+    /// menu labels are replayed later from `text_log`; this only restores the
+    /// already-upscaled panel, bevel, highlight, and divider pixels.
+    fn restore_logical_rect_physical(&self, buf: &mut [u32], rect: Rect) {
+        let (pw, ph) = self.phys;
+        let (lw, lh) = self.logical_size();
+        let (x, y, w, h) = rect;
+        let right = x.saturating_add(w).min(lw);
+        let bottom = y.saturating_add(h).min(lh);
+        if x >= right || y >= bottom {
+            return;
+        }
+
+        let scale = self.scale.max(1.0);
+        let px0 = ((x as f64 * scale).ceil() as usize).min(pw);
+        let px1 = ((right as f64 * scale).ceil() as usize).min(pw);
+        let py0 = ((y as f64 * scale).ceil() as usize).min(ph);
+        let py1 = ((bottom as f64 * scale).ceil() as usize).min(ph);
+        for py in py0..py1 {
+            let ly = ((py as f64 / scale) as usize).min(lh - 1);
+            let src = ly * lw;
+            let dst = py * pw;
+            for px in px0..px1 {
+                let lx = ((px as f64 / scale) as usize).min(lw - 1);
+                buf[dst + px] = self.fb[src + lx];
+            }
+        }
+    }
+
     /// Compose the complete frame at *physical* resolution into `buf`
     /// (`phys.0 × phys.1` pixels): paint the logical frame — capturing chrome
     /// text instead of drawing it when a real upscale is needed — then
@@ -1757,6 +1803,7 @@ impl State {
         // Capture chrome text instead of drawing it into the logical frame,
         // so it doesn't get upscaled-and-chunky — it's replayed crisply below.
         self.renderer.text_log = if scaled { Some(Vec::new()) } else { None };
+        self.renderer.overlay_text_start = None;
         self.skip_logical_terminal = scaled;
         self.paint();
         self.skip_logical_terminal = false;
@@ -1807,10 +1854,29 @@ impl State {
             (prev_ly, prev_drow) = (ly, drow);
         }
         // Now render text at true device resolution over the upscaled shapes:
-        // the terminal grid first, then the captured chrome strings.
+        // the terminal grid first, then base chrome, then opaque overlays and
+        // their labels. Restoring a menu before replaying base chrome would let
+        // sidebar labels punch through it.
         self.overdraw_terminal_physical(buf, pw, ph);
-        if let Some(cmds) = self.renderer.text_log.take() {
-            render_text_cmds(buf, pw, ph, &mut self.renderer, cmds, s, s);
+        if let Some(mut cmds) = self.renderer.text_log.take() {
+            if let Some(start) = self.renderer.overlay_text_start.take() {
+                let overlay = cmds.split_off(start.min(cmds.len()));
+                render_text_cmds(buf, pw, ph, &mut self.renderer, cmds, s, s);
+                if let Some(menu) = &self.ctx {
+                    self.restore_logical_rect_physical(
+                        buf,
+                        (
+                            menu.x,
+                            menu.y,
+                            CTX_W,
+                            ctx_menu_height(menu.items.len(), menu.seps().len()),
+                        ),
+                    );
+                }
+                render_text_cmds(buf, pw, ph, &mut self.renderer, overlay, s, s);
+            } else {
+                render_text_cmds(buf, pw, ph, &mut self.renderer, cmds, s, s);
+            }
         }
     }
 
@@ -2327,22 +2393,36 @@ fn resolve_path(cand: &str, cwd: Option<&Path>, home: &Path) -> Option<PathBuf> 
     p.exists().then_some(p)
 }
 
-/// Open a URL in the user's default handler, detached so the terminal never
-/// blocks on it. Best-effort: a missing opener is silently ignored.
+/// Open a URL in the user's default handler without blocking the event loop.
+/// macOS GUI apps do not inherit a reliable shell `PATH`, so use the system
+/// opener's absolute path there. The launcher is waited on in a worker so a
+/// failure is observable instead of becoming a silent no-op.
 fn open_url(url: &str) {
-    #[cfg(target_os = "macos")]
-    let mut cmd = std::process::Command::new("open");
-    #[cfg(not(target_os = "macos"))]
-    let mut cmd = std::process::Command::new("xdg-open");
-    let _ = cmd.arg(url).spawn();
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        let result = std::process::Command::new("/usr/bin/open").arg(&url).status();
+        #[cfg(not(target_os = "macos"))]
+        let result = std::process::Command::new("xdg-open").arg(&url).status();
+
+        match result {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!("termset: URL opener exited with {status}: {url}"),
+            Err(error) => eprintln!("termset: could not open URL {url:?}: {error}"),
+        }
+    });
 }
 
 /// Open a Google web search for `query` in the user's default browser.
 fn open_search(query: &str) {
-    open_url(&format!(
+    open_url(&google_search_url(query));
+}
+
+fn google_search_url(query: &str) -> String {
+    format!(
         "https://www.google.com/search?q={}",
         urlencode(query)
-    ));
+    )
 }
 
 /// Percent-encode `s` for use in a URL query (RFC 3986 unreserved set kept
@@ -3582,7 +3662,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // file remains untouched, so configured tabs return on
                         // the next launch.
                         st.sidebar
-                            .dispatch(&mut st.tree, sidebar::Action::Remove(node));
+                            .dispatch(&mut st.tree, sidebar::Action::RemoveAndSelectNext(node));
                         st.request_redraw();
                     }
                 }
@@ -4078,12 +4158,13 @@ impl ApplicationHandler<UserEvent> for App {
                             // was actually right-clicked, not the group row.
                             let node = st.shown().unwrap_or(st.sidebar.primary());
                             let (items, target) = st.term_ctx_items();
+                            let enabled = terminal_ctx_enabled(&items, target.as_deref());
                             st.ctx = Some(CtxMenu {
                                 x: (mx as usize).min(pw.saturating_sub(CTX_W)),
                                 y: ctx_menu_y(my as usize, ph, items.len(), ctx_sep_count(&items)),
                                 node,
                                 items,
-                                enabled: vec![true; terminal_ctx_actions().len()],
+                                enabled,
                                 target,
                             });
                             st.request_redraw();
@@ -4401,6 +4482,10 @@ mod tests {
             "cargo%20build%20--release"
         );
         assert_eq!(urlencode("a+b&c=d"), "a%2Bb%26c%3Dd");
+        assert_eq!(
+            google_search_url("termset macOS search"),
+            "https://www.google.com/search?q=termset%20macOS%20search"
+        );
     }
 
     // A fixed fixture in the YAML layout format. Tests must not depend on a
@@ -4646,6 +4731,15 @@ groups:
         assert_eq!(
             items.iter().map(|item| item.label()).collect::<Vec<_>>(),
             ["Copy", "Paste", "Search Google", "Paste + Submit", "Submit"],
+        );
+        assert_eq!(
+            terminal_ctx_enabled(&items, None),
+            [true, true, false, true, true],
+        );
+        assert!(
+            terminal_ctx_enabled(&items, Some("termset"))
+                .into_iter()
+                .all(|enabled| enabled)
         );
         let menu = CtxMenu {
             x: 0,

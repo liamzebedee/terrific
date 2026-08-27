@@ -1101,7 +1101,7 @@ pub(crate) fn draw_ctx_menu(
     }
 }
 
-fn ctx_menu_height(item_count: usize, sep_count: usize) -> usize {
+pub(crate) fn ctx_menu_height(item_count: usize, sep_count: usize) -> usize {
     ROW_H * item_count.max(1) + CTX_SEP_H * sep_count + 2
 }
 

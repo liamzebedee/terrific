@@ -41,6 +41,10 @@ pub(crate) enum Action {
     BeginRename(NodeId),
     Rename { input: RenameInput, caret: usize },
     Remove(NodeId),
+    /// Remove a naturally-exited session and, when it was selected, prefer the
+    /// next visible row. Ctrl+D should advance through tabs instead of jumping
+    /// to an earlier row (or the top of the tree).
+    RemoveAndSelectNext(NodeId),
 }
 
 /// Effects emitted by one atomic reducer transition.
@@ -139,7 +143,8 @@ impl State {
             Action::Reorder(placement) => self.reorder(tree, placement),
             Action::BeginRename(node) => self.begin_rename(tree, node),
             Action::Rename { input, caret } => self.rename(tree, input, caret),
-            Action::Remove(node) => self.remove(tree, node),
+            Action::Remove(node) => self.remove(tree, node, false),
+            Action::RemoveAndSelectNext(node) => self.remove(tree, node, true),
         }
     }
 
@@ -396,7 +401,19 @@ impl State {
         }
     }
 
-    fn remove(&mut self, tree: &mut Tree, node: NodeId) -> Outcome {
+    fn remove(&mut self, tree: &mut Tree, node: NodeId, prefer_next: bool) -> Outcome {
+        // Capture the row immediately below before unlinking. It cannot be a
+        // descendant of `node` (only leaves are closed), so it remains a valid
+        // candidate unless pruning removes an empty group around it.
+        let next = if prefer_next && self.primary == node {
+            let rows = self.rows(tree);
+            rows.iter()
+                .position(|row| row.id == node)
+                .and_then(|index| rows.get(index + 1))
+                .map(|row| row.id)
+        } else {
+            None
+        };
         let preferred = tree.unlink(node);
         if preferred.is_none() {
             return Outcome::default();
@@ -411,9 +428,14 @@ impl State {
             self.rename = None;
         }
         if !attached(tree, self.primary) {
-            let target = preferred
+            let target = next
                 .filter(|&id| attached(tree, id) && id != tree.root)
                 .and_then(|id| tree.first_leaf(id).or(Some(id)))
+                .or_else(|| {
+                    preferred
+                        .filter(|&id| attached(tree, id) && id != tree.root)
+                        .and_then(|id| tree.first_leaf(id).or(Some(id)))
+                })
                 .or_else(|| tree.first_leaf(tree.root))
                 .unwrap_or(tree.root);
             self.select_only(target);
@@ -608,6 +630,20 @@ mod tests {
         sidebar.dispatch(&mut tree, Action::Remove(children[1]));
         assert!(tree.nodes[group].parent.is_none());
         assert_ne!(sidebar.primary(), group);
+    }
+
+    #[test]
+    fn natural_exit_selects_the_next_visible_tab() {
+        let mut tree = tree();
+        let [one, two, three] = tree.nodes[tree.root].children[..] else {
+            panic!()
+        };
+        let mut sidebar = State::new(two);
+
+        sidebar.dispatch(&mut tree, Action::RemoveAndSelectNext(two));
+
+        assert_eq!(sidebar.primary(), three);
+        assert_eq!(tree.nodes[tree.root].children, [one, three]);
     }
 
     #[test]

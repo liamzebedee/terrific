@@ -198,12 +198,13 @@ impl Harness {
         let (pw, ph) = self.state.logical_size();
         let node = self.state.shown().unwrap_or(self.state.sidebar.primary());
         let (items, target) = self.state.term_ctx_items();
+        let enabled = crate::terminal_ctx_enabled(&items, target.as_deref());
         self.state.ctx = Some(crate::CtxMenu {
             x: (x as usize).min(pw.saturating_sub(crate::CTX_W)),
             y: crate::ctx_menu_y(y as usize, ph, items.len(), crate::ctx_sep_count(&items)),
             node,
             items,
-            enabled: vec![true; crate::terminal_ctx_actions().len()],
+            enabled,
             target,
         });
         self

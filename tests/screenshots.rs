@@ -113,6 +113,10 @@ fn retina_physical_frames() {
     h.select("Diabetes/Sugar tracker")
         .feed("Sugar tracker", SAMPLE);
     h.screenshot_physical("retina2x-terminal");
+    h.mouse_at(430.0, 120.0).ctx_terminal();
+    h.screenshot_physical("retina2x-context-menu");
+    h.mouse_at(90.0, 150.0).ctx_sidebar();
+    h.screenshot_physical("retina2x-sidebar-menu");
     h.inspector(true);
     h.screenshot_physical("retina2x-inspector");
     h.inspector(false).sidebar(false);
