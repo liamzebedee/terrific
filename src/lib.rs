@@ -172,8 +172,8 @@ impl Tree {
     /// "Edit Config" session) is hidden from the sidebar unless it equals
     /// `reveal` — i.e. it only shows while it's the active tab. Pass an invalid
     /// id (e.g. the root) to hide all volatile nodes.
-    fn rows(&self, reveal: NodeId) -> Vec<Row> {
-        fn go(t: &Tree, id: NodeId, depth: usize, reveal: NodeId, out: &mut Vec<Row>) {
+    fn rows(&self, reveal: NodeId) -> Vec<Row<'_>> {
+        fn go<'a>(t: &'a Tree, id: NodeId, depth: usize, reveal: NodeId, out: &mut Vec<Row<'a>>) {
             for &c in &t.nodes[id].children {
                 let n = &t.nodes[c];
                 if n.volatile && c != reveal {
@@ -182,7 +182,7 @@ impl Tree {
                 let is_group = matches!(n.kind, Kind::Group);
                 out.push(Row {
                     id: c,
-                    name: n.name.clone(),
+                    name: n.name.as_str(),
                     is_group,
                     depth,
                 });
@@ -194,6 +194,63 @@ impl Tree {
         let mut out = Vec::new();
         go(self, self.root, 0, reveal, &mut out);
         out
+    }
+
+    /// Visible row adjacent to `current`, wrapping at the ends. This mirrors
+    /// [`Self::rows`] but streams the DFS so keyboard navigation does not
+    /// allocate or clone every label on each keypress.
+    fn visible_neighbor(&self, current: NodeId, reveal: NodeId, forward: bool) -> Option<NodeId> {
+        struct Walk {
+            first: Option<NodeId>,
+            last: Option<NodeId>,
+            prev: Option<NodeId>,
+            found_current: bool,
+            next: Option<NodeId>,
+            saw_current: bool,
+        }
+
+        fn go(t: &Tree, id: NodeId, reveal: NodeId, current: NodeId, w: &mut Walk) {
+            for &c in &t.nodes[id].children {
+                let n = &t.nodes[c];
+                if n.volatile && c != reveal {
+                    continue;
+                }
+                if w.first.is_none() {
+                    w.first = Some(c);
+                }
+                if w.found_current && w.next.is_none() {
+                    w.next = Some(c);
+                }
+                if c == current {
+                    w.saw_current = true;
+                    w.found_current = true;
+                } else if !w.found_current {
+                    w.prev = Some(c);
+                }
+                w.last = Some(c);
+                if matches!(n.kind, Kind::Group) && n.expanded {
+                    go(t, c, reveal, current, w);
+                }
+            }
+        }
+
+        let mut w = Walk {
+            first: None,
+            last: None,
+            prev: None,
+            found_current: false,
+            next: None,
+            saw_current: false,
+        };
+        go(self, self.root, reveal, current, &mut w);
+        if !w.saw_current {
+            return w.first;
+        }
+        if forward {
+            w.next.or(w.first)
+        } else {
+            w.prev.or(w.last)
+        }
     }
 
     /// Every leaf in `id`'s subtree (a leaf yields itself). The fold that turns
@@ -230,6 +287,20 @@ impl Tree {
         self.leaves(id).into_iter().next()
     }
 
+    /// First leaf in DFS order matching `pred`, without materializing the
+    /// subtree. Used on repaint for selected groups, so it stays allocation-free.
+    fn first_leaf_matching(&self, id: NodeId, pred: &dyn Fn(NodeId) -> bool) -> Option<NodeId> {
+        if self.is_leaf(id) {
+            return pred(id).then_some(id);
+        }
+        for &c in &self.nodes[id].children {
+            if let Some(found) = self.first_leaf_matching(c, pred) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     /// The sibling immediately before `id` among its parent's children, if any
     /// (i.e. `None` when `id` is the first child). Used to pick what to select
     /// after closing a session.
@@ -257,9 +328,9 @@ impl Tree {
 }
 
 /// A flattened, render-ready view of one visible tree node.
-struct Row {
+struct Row<'a> {
     id: NodeId,
-    name: String,
+    name: &'a str,
     is_group: bool,
     /// Tree depth: `0` for a top-level node (a section, or a standalone
     /// top-level session like "Edit Config"), `1+` for nested sessions.
@@ -496,6 +567,7 @@ fn match_shortcut(mods: ModifiersState, key: &Key) -> Option<Shortcut> {
 fn encode_key_for_pty(mods: ModifiersState, key: &Key, text: Option<&str>) -> Option<Vec<u8>> {
     let (ctrl, alt, shift) = (mods.control_key(), mods.alt_key(), mods.shift_key());
     let plain_alt = alt && !ctrl && !shift;
+    let plain_alt_shift = alt && !ctrl && shift;
 
     // zsh's default emacs bindings know Meta-b / Meta-f for word navigation,
     // but not every install binds xterm's modified-arrow CSI sequences.
@@ -503,8 +575,12 @@ fn encode_key_for_pty(mods: ModifiersState, key: &Key, text: Option<&str>) -> Op
         match key {
             Key::Named(NamedKey::ArrowLeft) => return Some(b"\x1bb".to_vec()),
             Key::Named(NamedKey::ArrowRight) => return Some(b"\x1bf".to_vec()),
+            Key::Named(NamedKey::Tab) => return Some(b"\x1bf".to_vec()),
             _ => {}
         }
+    }
+    if plain_alt_shift && matches!(key, Key::Named(NamedKey::Tab)) {
+        return Some(b"\x1bb".to_vec());
     }
 
     // xterm modifier parameter: 1 + shift + 2*alt + 4*ctrl.
@@ -525,6 +601,7 @@ fn encode_key_for_pty(mods: ModifiersState, key: &Key, text: Option<&str>) -> Op
     };
 
     Some(match key {
+        Key::Named(NamedKey::Enter) if shift && !ctrl && !alt => b"\x1b[13;2u".to_vec(),
         Key::Named(NamedKey::Enter) => vec![b'\r'],
         Key::Named(NamedKey::Backspace) => {
             if ctrl {
@@ -585,6 +662,21 @@ fn encode_key_for_pty(mods: ModifiersState, key: &Key, text: Option<&str>) -> Op
             None => return None,
         },
     })
+}
+
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut bytes = Vec::with_capacity(text.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(text.replace("\r\n", "\n").replace('\r', "\n").as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        text.replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\n', "\r")
+            .into_bytes()
+    }
 }
 
 /// Observe what a PTY's shell is doing (is a command in the foreground, and
@@ -1779,9 +1871,7 @@ impl State {
             return Some(self.selected);
         }
         self.tree
-            .leaves(self.selected)
-            .into_iter()
-            .find(|l| self.sessions.contains_key(l))
+            .first_leaf_matching(self.selected, &|l| self.sessions.contains_key(&l))
     }
 
     /// `(display_offset, history_size, screen_lines)` of the shown terminal's
@@ -2612,17 +2702,23 @@ impl App {
     /// collapsed) snaps back to the first row.
     fn select_relative(&mut self, delta: i32) {
         let Some(st) = self.state.as_mut() else { return };
-        let rows = st.tree.rows(st.selected);
-        if rows.is_empty() {
+        let steps = delta.unsigned_abs();
+        if steps == 0 {
             return;
         }
-        let next = match rows.iter().position(|r| r.id == st.selected) {
-            Some(i) => (i as i32 + delta).rem_euclid(rows.len() as i32) as usize,
-            None => 0,
-        };
-        st.selected = rows[next].id;
-        st.focus = None;
-        st.request_redraw();
+        let forward = delta > 0;
+        let mut next = st.selected;
+        for _ in 0..steps {
+            let Some(n) = st.tree.visible_neighbor(next, st.selected, forward) else {
+                return;
+            };
+            next = n;
+        }
+        if next != st.selected {
+            st.selected = next;
+            st.focus = None;
+            st.request_redraw();
+        }
     }
 
     /// Fold (⌘←/Ctrl+Shift+←) or unfold (⌘→/Ctrl+Shift+→) the selected group.
@@ -2857,7 +2953,22 @@ impl App {
             .and_then(|st| st.clipboard.as_mut())
             .and_then(|cb| cb.get_text().ok());
         if let Some(text) = text {
-            self.send(text.replace('\n', "\r").into_bytes());
+            let bracketed = self
+                .state
+                .as_ref()
+                .and_then(|st| {
+                    let node = st.shown()?;
+                    Some(
+                        st.sessions[&node]
+                            .tab
+                            .term
+                            .lock()
+                            .mode()
+                            .contains(TermMode::BRACKETED_PASTE),
+                    )
+                })
+                .unwrap_or(false);
+            self.send(paste_bytes(&text, bracketed));
         }
     }
 }
@@ -4555,6 +4666,7 @@ groups:
         let ctrl_alt = ModifiersState::CONTROL | ModifiersState::ALT;
         let left = Key::Named(NamedKey::ArrowLeft);
         let right = Key::Named(NamedKey::ArrowRight);
+        let enter = Key::Named(NamedKey::Enter);
 
         assert_eq!(
             encode_key_for_pty(ModifiersState::empty(), &left, None).as_deref(),
@@ -4565,8 +4677,8 @@ groups:
             Some(b"\x1b[C".as_slice())
         );
 
-        // Plain Alt+Left/Right should work in stock zsh by sending Meta-b/f,
-        // the same bindings as Alt+b and Alt+f.
+        // Plain Alt+Left/Right and Alt+Tab should work in stock zsh by sending
+        // Meta-b/f, the same bindings as Alt+b and Alt+f.
         assert_eq!(
             encode_key_for_pty(alt, &left, None).as_deref(),
             Some(b"\x1bb".as_slice())
@@ -4575,11 +4687,47 @@ groups:
             encode_key_for_pty(alt, &right, None).as_deref(),
             Some(b"\x1bf".as_slice())
         );
+        assert_eq!(
+            encode_key_for_pty(alt, &Key::Named(NamedKey::Tab), None).as_deref(),
+            Some(b"\x1bf".as_slice())
+        );
+        assert_eq!(
+            encode_key_for_pty(
+                ModifiersState::ALT | ModifiersState::SHIFT,
+                &Key::Named(NamedKey::Tab),
+                None
+            )
+            .as_deref(),
+            Some(b"\x1bb".as_slice())
+        );
 
         // Additional modifiers keep the xterm modified-arrow form for TUI apps.
         assert_eq!(
             encode_key_for_pty(ctrl_alt, &left, None).as_deref(),
             Some(b"\x1b[1;7D".as_slice())
+        );
+
+        // Codex/Claude-style TUIs use CSI-u Shift+Enter as "insert newline",
+        // distinct from plain Enter submitting the prompt.
+        assert_eq!(
+            encode_key_for_pty(ModifiersState::empty(), &enter, None).as_deref(),
+            Some(b"\r".as_slice())
+        );
+        assert_eq!(
+            encode_key_for_pty(ModifiersState::SHIFT, &enter, None).as_deref(),
+            Some(b"\x1b[13;2u".as_slice())
+        );
+    }
+
+    #[test]
+    fn paste_bytes_use_bracketed_paste_when_enabled() {
+        assert_eq!(
+            paste_bytes("one\ntwo\r\nthree\rfour", false),
+            b"one\rtwo\rthree\rfour"
+        );
+        assert_eq!(
+            paste_bytes("one\ntwo\r\nthree\rfour", true),
+            b"\x1b[200~one\ntwo\nthree\nfour\x1b[201~"
         );
     }
 }

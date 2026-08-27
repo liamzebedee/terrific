@@ -758,7 +758,7 @@ pub(crate) fn draw_sidebar(
     pw: usize,
     ph: usize,
     r: &mut Renderer,
-    rows: &[Row],
+    rows: &[Row<'_>],
     selected: NodeId,
     hovered: Option<NodeId>,
     sidebar_w: usize,
@@ -815,7 +815,7 @@ pub(crate) fn draw_sidebar(
             SIDEBAR_PAD_L,
             y,
             sidebar_w.saturating_sub(SIDEBAR_PAD_L),
-            &row.name,
+            row.name,
             color,
         );
     }
@@ -826,7 +826,7 @@ pub(crate) fn draw_sidebar(
 /// standalone "Edit Config" session) read as separated blocks. Shared by
 /// [`draw_sidebar`] and `sidebar_hit` so the picture on screen and the click map
 /// can never disagree.
-pub(crate) fn sidebar_row_tops(rows: &[Row], rh: usize) -> Vec<usize> {
+pub(crate) fn sidebar_row_tops(rows: &[Row<'_>], rh: usize) -> Vec<usize> {
     let mut tops = Vec::with_capacity(rows.len());
     let mut y = 0;
     for (i, row) in rows.iter().enumerate() {
