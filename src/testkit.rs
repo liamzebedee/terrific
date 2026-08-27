@@ -7,7 +7,7 @@
 //! a fresh per-run temp directory with sequential filenames. Each save prints
 //!
 //! ```text
-//! Screenshot taken: /tmp/termem-shots-<run>/001-<label>.png
+//! Screenshot taken: /tmp/termset-shots-<run>/001-<label>.png
 //! ```
 //!
 //! so a reviewer (human or agent) can open the files and see exactly what the
@@ -56,10 +56,19 @@ impl Harness {
             tree,
             sessions: std::collections::HashMap::new(),
             id_of: std::collections::HashMap::new(),
-            selected,
+            sidebar: crate::sidebar::State::new(selected),
+            sidebar_drag: None,
             config_node: None,
             next_id: 0,
             ctx: None,
+            // Headless harness stays hermetic: never touch the on-disk license
+            // or launch counter, and never pop a modal.
+            #[cfg(feature = "licensing")]
+            license: None,
+            #[cfg(feature = "licensing")]
+            modal: None,
+            #[cfg(feature = "licensing")]
+            modal_press: None,
             clipboard: None,
             mouse: (0.0, 0.0),
             selecting: false,
@@ -80,7 +89,7 @@ impl Harness {
             link_cells: std::collections::HashSet::new(),
         };
         let dir = std::env::temp_dir().join(format!(
-            "termem-shots-{}-{}",
+            "termset-shots-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -88,11 +97,7 @@ impl Harness {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).expect("create screenshot dir");
-        Harness {
-            state,
-            dir,
-            seq: 0,
-        }
+        Harness { state, dir, seq: 0 }
     }
 
     /// The per-run screenshot directory (printed once for convenience).
@@ -115,7 +120,9 @@ impl Harness {
             self.state.tree.nodes[p].expanded = true;
             cur = self.state.tree.nodes[p].parent;
         }
-        self.state.selected = id;
+        self.state
+            .sidebar
+            .dispatch(&mut self.state.tree, crate::sidebar::Action::SelectOnly(id));
         self
     }
 
@@ -135,6 +142,74 @@ impl Harness {
     /// (`0`=minimize, `1`=maximize, `2`=close), or `None` to clear hover.
     pub fn hover_win(&mut self, which: Option<usize>) -> &mut Self {
         self.state.win_hover = which;
+        self
+    }
+
+    /// Show the unregistered-copy nag modal (as it appears on launch).
+    #[cfg(feature = "licensing")]
+    pub fn nag(&mut self) -> &mut Self {
+        self.state.modal = Some(crate::Modal::Nag);
+        self
+    }
+
+    /// Show the license-key entry modal with `input` pre-filled; `error` draws
+    /// the "key was not valid" state.
+    #[cfg(feature = "licensing")]
+    pub fn enter_key(&mut self, input: &str, error: bool) -> &mut Self {
+        self.state.modal = Some(crate::Modal::EnterKey {
+            input: input.to_string(),
+            error,
+        });
+        self
+    }
+
+    /// Position the (logical) pointer, for hover screenshots.
+    pub fn mouse_at(&mut self, x: f64, y: f64) -> &mut Self {
+        self.state.mouse = (x, y);
+        self
+    }
+
+    /// Open the sidebar (tab) context menu at the pointer, as a right-click on
+    /// the selected node would.
+    pub fn ctx_sidebar(&mut self) -> &mut Self {
+        let (x, y) = self.state.mouse;
+        let (_, ph) = self.state.logical_size();
+        let items = crate::sidebar_ctx_items();
+        self.state.ctx = Some(crate::CtxMenu {
+            x: (x as usize).min(self.state.sidebar_w()),
+            y: crate::ctx_menu_y(y as usize, ph, items.len(), crate::ctx_sep_count(&items)),
+            node: self.state.sidebar.primary(),
+            items,
+            enabled: vec![true; crate::sidebar_ctx_items().len()],
+            target: None,
+        });
+        self
+    }
+
+    /// Open the terminal-content context menu at the pointer, as a right-click
+    /// in the terminal area would. Contents depend on what is under the pointer
+    /// (link / selection / word), so `mouse_at` first.
+    pub fn ctx_terminal(&mut self) -> &mut Self {
+        let (x, y) = self.state.mouse;
+        let (pw, ph) = self.state.logical_size();
+        let node = self.state.shown().unwrap_or(self.state.sidebar.primary());
+        let (items, target) = self.state.term_ctx_items();
+        self.state.ctx = Some(crate::CtxMenu {
+            x: (x as usize).min(pw.saturating_sub(crate::CTX_W)),
+            y: crate::ctx_menu_y(y as usize, ph, items.len(), crate::ctx_sep_count(&items)),
+            node,
+            items,
+            enabled: vec![true; crate::terminal_ctx_actions().len()],
+            target,
+        });
+        self
+    }
+
+    /// Arm a modal button as pressed (mouse held down on it), for press-state
+    /// screenshots. Index is per-modal (see `State::modal_btn_at`).
+    #[cfg(feature = "licensing")]
+    pub fn press_modal_btn(&mut self, idx: usize) -> &mut Self {
+        self.state.modal_press = Some(idx);
         self
     }
 

@@ -1,18 +1,18 @@
-//! manyterm — a workspace-organized mini terminal emulator.
+//! termset — a workspace-organized mini terminal emulator.
 //! (crate `termset_cli`; binary `terms`.)
 //!
 //! Backend : `alacritty_terminal` (PTY + VT/ANSI state machine + parser thread)
 //! Frontend: `winit` (window + keyboard/mouse) + `softbuffer` (CPU framebuffer)
 //!           + `fontdue` (glyph rasterization)
 //!
-//! Architecture is functional-core / imperative-shell:
+//! Architecture is model / reducer / view / effect shell:
 //!
-//!   * The workspace is a *rose tree* parsed from the `workspace` file. The
-//!     tree and every decision over it (which rows to draw, which leaves a
-//!     group contains, what to start/stop, whether something is already
-//!     running) are **pure functions** — see the `core` section.
-//!   * Only PTY spawning, byte I/O, `/proc` observation and drawing are
-//!     effectful; those live in the `shell` section (`State` / `App`).
+//!   * [`model`] owns the workspace tree and structural invariants.
+//!   * [`sidebar`] reduces input actions into model/state changes plus explicit
+//!     redraw and persistence effects.
+//!   * [`ui`] is a pure framebuffer projection of read-only view models.
+//!   * `App` translates winit events and executes filesystem, PTY, and window
+//!     effects; it does not encode sidebar mutation rules.
 //!
 //! Run with: `cargo run --release`
 
@@ -42,9 +42,14 @@ use winit::window::{CursorIcon, Window, WindowId};
 pub mod testkit;
 
 mod config;
+#[cfg(feature = "licensing")]
+mod license;
+mod model;
+mod sidebar;
 mod tmux;
 mod ui;
 use config::*;
+pub(crate) use model::*;
 use ui::*;
 
 const FONT_PX: f32 = 16.0;
@@ -57,214 +62,8 @@ const NO_SESSION_HINT: &str =
 const NO_SESSION_HINT: &str =
     "No session here. Right-click a node \u{2192} Start, or Ctrl+Shift+T for a shell.";
 
-// ===========================================================================
-// core — the workspace as a pure rose tree
-// ===========================================================================
-
-/// Stable identifier for a position in the tree (arena index). Stable for the
-/// lifetime of the process, including across spawn/exit of a leaf's session.
-type NodeId = usize;
-
-/// What a node *is*. `Leaf` carries the spec needed to run it.
-#[derive(Clone)]
-enum Kind {
-    /// The invisible forest root (`workspaces`).
-    Root,
-    /// A folder. May contain groups and leaves. Has no command of its own.
-    Group,
-    /// A runnable session: a working directory and a default command. An
-    /// empty `command` means "just a shell here" (Scratch/Transient/new tab).
-    Leaf { workdir: PathBuf, command: String },
-}
-
-/// One node of the workspace tree. `expanded`/`dynamic` are the only mutable
-/// bits and they are explicit, never hidden behind a traversal.
-struct Node {
-    parent: Option<NodeId>,
-    children: Vec<NodeId>,
-    name: String,
-    kind: Kind,
-    /// Groups only: whether children are shown. Ignored for leaves.
-    expanded: bool,
-    /// Created at runtime (a new scratch tab) rather than from the spec file.
-    /// Dynamic leaves are removed from the tree when their session exits.
-    dynamic: bool,
-    /// Never serialized to the workspace file — a purely runtime helper tab
-    /// (the background "edit layout" nano session). Recreated each launch.
-    volatile: bool,
-}
-
-/// The workspace. An arena of `Node`s plus the root index. The arena layout is
-/// the idiomatic Rust spelling of an immutable-shaped tree: structure is set
-/// up once, traversals below are pure reads, mutations are localized.
-struct Tree {
-    nodes: Vec<Node>,
-    root: NodeId,
-}
-
-impl Tree {
-    fn push(&mut self, parent: Option<NodeId>, name: String, kind: Kind, dynamic: bool) -> NodeId {
-        let id = self.nodes.len();
-        self.nodes.push(Node {
-            parent,
-            children: Vec::new(),
-            name,
-            kind,
-            expanded: true,
-            dynamic,
-            volatile: false,
-        });
-        if let Some(p) = parent {
-            self.nodes[p].children.push(id);
-        }
-        id
-    }
-
-    fn is_group(&self, id: NodeId) -> bool {
-        matches!(self.nodes[id].kind, Kind::Group | Kind::Root)
-    }
-    fn is_leaf(&self, id: NodeId) -> bool {
-        matches!(self.nodes[id].kind, Kind::Leaf { .. })
-    }
-
-    /// Leaf spec, if `id` is a leaf.
-    fn leaf_spec(&self, id: NodeId) -> Option<(&Path, &str)> {
-        match &self.nodes[id].kind {
-            Kind::Leaf { workdir, command } => Some((workdir.as_path(), command.as_str())),
-            _ => None,
-        }
-    }
-
-    /// Mutable handle to a leaf's default command (the inspector edits this).
-    fn command_mut(&mut self, id: NodeId) -> Option<&mut String> {
-        match &mut self.nodes[id].kind {
-            Kind::Leaf { command, .. } => Some(command),
-            _ => None,
-        }
-    }
-
-    /// Set a leaf's working directory (the inspector / use-cwd button). No-op
-    /// on a group.
-    fn set_workdir(&mut self, id: NodeId, dir: PathBuf) {
-        if let Kind::Leaf { workdir, .. } = &mut self.nodes[id].kind {
-            *workdir = dir;
-        }
-    }
-
-    /// Current text of an inspector field for `id`. `Command`/`Directory` are
-    /// `None` on a group (it has neither — those fields render disabled).
-    fn field_text(&self, id: NodeId, f: Field) -> Option<String> {
-        match f {
-            Field::Title => Some(self.nodes[id].name.clone()),
-            Field::Command => self.leaf_spec(id).map(|(_, c)| c.to_string()),
-            Field::Dir => self
-                .leaf_spec(id)
-                .map(|(w, _)| w.display().to_string()),
-        }
-    }
-
-    /// DFS over visible nodes (groups gate their subtree via `expanded`). This
-    /// is the catamorphism the sidebar render and hit-testing both fold over,
-    /// so the picture on screen and the click map can never disagree.
-    ///
-    /// `reveal` is the currently-selected node: a *volatile* node (the pre-warmed
-    /// "Edit Config" session) is hidden from the sidebar unless it equals
-    /// `reveal` — i.e. it only shows while it's the active tab. Pass an invalid
-    /// id (e.g. the root) to hide all volatile nodes.
-    fn rows(&self, reveal: NodeId) -> Vec<Row> {
-        fn go(t: &Tree, id: NodeId, depth: usize, reveal: NodeId, out: &mut Vec<Row>) {
-            for &c in &t.nodes[id].children {
-                let n = &t.nodes[c];
-                if n.volatile && c != reveal {
-                    continue; // hidden background tab (e.g. Edit Config)
-                }
-                let is_group = matches!(n.kind, Kind::Group);
-                out.push(Row {
-                    id: c,
-                    name: n.name.clone(),
-                    is_group,
-                    depth,
-                });
-                if is_group && n.expanded {
-                    go(t, c, depth + 1, reveal, out);
-                }
-            }
-        }
-        let mut out = Vec::new();
-        go(self, self.root, 0, reveal, &mut out);
-        out
-    }
-
-    /// Every leaf in `id`'s subtree (a leaf yields itself). The fold that turns
-    /// "Start on a group" into "start each of these leaves".
-    fn leaves(&self, id: NodeId) -> Vec<NodeId> {
-        let mut out = Vec::new();
-        fn go(t: &Tree, id: NodeId, out: &mut Vec<NodeId>) {
-            if t.is_leaf(id) {
-                out.push(id);
-                return;
-            }
-            for &c in &t.nodes[id].children {
-                go(t, c, out);
-            }
-        }
-        go(self, id, &mut out);
-        out
-    }
-
-    /// The group a new session should be attached to given the current
-    /// selection: a selected group is its own context; a selected leaf hands
-    /// off to its enclosing group.
-    fn group_for_new(&self, sel: NodeId) -> NodeId {
-        if self.is_group(sel) {
-            sel
-        } else {
-            self.nodes[sel].parent.unwrap_or(self.root)
-        }
-    }
-
-    /// First leaf in the subtree, in DFS order — used to pick what terminal to
-    /// show when a group (rather than a leaf) is selected.
-    fn first_leaf(&self, id: NodeId) -> Option<NodeId> {
-        self.leaves(id).into_iter().next()
-    }
-
-    /// The sibling immediately before `id` among its parent's children, if any
-    /// (i.e. `None` when `id` is the first child). Used to pick what to select
-    /// after closing a session.
-    fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {
-        let p = self.nodes[id].parent?;
-        let kids = &self.nodes[p].children;
-        let i = kids.iter().position(|&c| c == id)?;
-        i.checked_sub(1).map(|j| kids[j])
-    }
-
-    /// `Group / Sub / Leaf` path string for the header bar.
-    fn path(&self, id: NodeId) -> String {
-        let mut parts = Vec::new();
-        let mut cur = Some(id);
-        while let Some(c) = cur {
-            if c == self.root {
-                break;
-            }
-            parts.push(self.nodes[c].name.clone());
-            cur = self.nodes[c].parent;
-        }
-        parts.reverse();
-        parts.join("  /  ")
-    }
-}
-
-/// A flattened, render-ready view of one visible tree node.
-struct Row {
-    id: NodeId,
-    name: String,
-    is_group: bool,
-    /// Tree depth: `0` for a top-level node (a section, or a standalone
-    /// top-level session like "Edit Config"), `1+` for nested sessions.
-    depth: usize,
-}
-
+/// Keep group expand/collapse implemented but unavailable in the current UI.
+const GROUP_TOGGLE_ENABLED: bool = false;
 
 /// What the shell observed about a session's PTY, gathered from `/proc`.
 /// Effectful to *produce* (`observe`), but a plain value the planner reasons
@@ -312,6 +111,18 @@ impl Field {
     const ALL: [Field; 3] = [Field::Title, Field::Command, Field::Dir];
     fn index(self) -> usize {
         Field::ALL.iter().position(|&x| x == self).unwrap()
+    }
+}
+
+impl Tree {
+    /// Inspector projection kept outside the domain model: `Field` is a view
+    /// concern, while the model exposes names and leaf specs.
+    fn field_text(&self, id: NodeId, field: Field) -> Option<String> {
+        match field {
+            Field::Title => Some(self.nodes[id].name.clone()),
+            Field::Command => self.leaf_spec(id).map(|(_, command)| command.to_string()),
+            Field::Dir => self.leaf_spec(id).map(|(dir, _)| dir.display().to_string()),
+        }
     }
 }
 
@@ -526,7 +337,11 @@ mod sys {
         fn children(pid: u32) -> Vec<u32> {
             std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
                 .ok()
-                .map(|s| s.split_whitespace().filter_map(|x| x.parse().ok()).collect())
+                .map(|s| {
+                    s.split_whitespace()
+                        .filter_map(|x| x.parse().ok())
+                        .collect()
+                })
                 .unwrap_or_default()
         }
         let mut cur = shell_pid;
@@ -561,7 +376,8 @@ mod sys {
         // macOS has no `/proc`; these libproc(3) syscalls are the supported way
         // to walk the process tree and read a process's executable path.
         unsafe extern "C" {
-            pub fn proc_listchildpids(ppid: c_int, buffer: *mut c_void, buffersize: c_int) -> c_int;
+            pub fn proc_listchildpids(ppid: c_int, buffer: *mut c_void, buffersize: c_int)
+            -> c_int;
             pub fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
         }
 
@@ -580,16 +396,18 @@ mod sys {
             if n <= 0 {
                 return Vec::new();
             }
-            buf.into_iter().filter(|&p| p > 0).map(|p| p as u32).collect()
+            buf.into_iter()
+                .filter(|&p| p > 0)
+                .map(|p| p as u32)
+                .collect()
         }
 
         /// Absolute path of `pid`'s executable, if readable.
         pub fn path(pid: u32) -> Option<String> {
             const MAX: usize = 4096; // PROC_PIDPATHINFO_MAXSIZE
             let mut buf = vec![0u8; MAX];
-            let n = unsafe {
-                proc_pidpath(pid as c_int, buf.as_mut_ptr() as *mut c_void, MAX as u32)
-            };
+            let n =
+                unsafe { proc_pidpath(pid as c_int, buf.as_mut_ptr() as *mut c_void, MAX as u32) };
             if n <= 0 {
                 return None;
             }
@@ -691,9 +509,7 @@ impl EventListener for Listener {
         };
         let _ = match event {
             TermEvent::Wakeup => proxy.send_event(UserEvent::Wakeup),
-            TermEvent::Exit | TermEvent::ChildExit(_) => {
-                proxy.send_event(UserEvent::Exit(*id))
-            }
+            TermEvent::Exit | TermEvent::ChildExit(_) => proxy.send_event(UserEvent::Exit(*id)),
             TermEvent::Title(t) => proxy.send_event(UserEvent::Title(*id, t)),
             TermEvent::ResetTitle => proxy.send_event(UserEvent::ResetTitle(*id)),
             // A program queried a terminal color (e.g. OSC 11 background).
@@ -712,9 +528,7 @@ impl EventListener for Listener {
             // OSC 52: a program copies to the system clipboard (vim/tmux yank).
             // Only the *write* is honored; OSC 52 reads are intentionally not
             // implemented (they let any program exfiltrate the clipboard).
-            TermEvent::ClipboardStore(_, text) => {
-                proxy.send_event(UserEvent::ClipboardStore(text))
-            }
+            TermEvent::ClipboardStore(_, text) => proxy.send_event(UserEvent::ClipboardStore(text)),
             _ => Ok(()),
         };
     }
@@ -907,7 +721,8 @@ const NOTO_EMOJI: &[u8] = include_bytes!("../assets/fonts/NotoEmoji-Regular.ttf"
 /// critical path on a worker thread — see `Renderer::new`.
 fn load_fallback_fonts() -> Vec<fontdue::Font> {
     let mut fallbacks: Vec<fontdue::Font> = Vec::new();
-    if let Ok(f) = fontdue::Font::from_bytes(NOTO_EMOJI.to_vec(), fontdue::FontSettings::default()) {
+    if let Ok(f) = fontdue::Font::from_bytes(NOTO_EMOJI.to_vec(), fontdue::FontSettings::default())
+    {
         fallbacks.push(f);
     }
     fallbacks.extend(
@@ -961,8 +776,6 @@ fn fallback_font_paths() -> Vec<String> {
         paths
     }
 }
-
-
 
 /// Where a tab's bytes come from and go to. The `Term` (VT state machine,
 /// grid, scrollback) is identical either way — only the transport differs.
@@ -1069,7 +882,10 @@ fn spawn_session(
                 );
             }
             Err(e) => {
-                eprintln!("termset: tmux session {:?} failed ({e}); falling back to a local PTY", cfg.session);
+                eprintln!(
+                    "termset: tmux session {:?} failed ({e}); falling back to a local PTY",
+                    cfg.session
+                );
             }
         }
     }
@@ -1107,8 +923,8 @@ fn spawn_session(
     // Capture the child shell pid before the event loop takes ownership.
     let pid = pty.child().id();
 
-    let pty_loop =
-        PtyEventLoop::new(term.clone(), listener, pty, false, false).expect("create pty event loop");
+    let pty_loop = PtyEventLoop::new(term.clone(), listener, pty, false, false)
+        .expect("create pty event loop");
     let pty_tx = pty_loop.channel();
     pty_loop.spawn();
     (
@@ -1169,6 +985,20 @@ fn resolve_workdir(base: &Path, dir: &Path) -> PathBuf {
     }
 }
 
+fn new_tab_workdir(
+    tree: &Tree,
+    selected: NodeId,
+    live_cwd: Option<PathBuf>,
+    home: &Path,
+) -> PathBuf {
+    live_cwd
+        .or_else(|| {
+            tree.leaf_spec(selected)
+                .map(|(workdir, _)| workdir.to_path_buf())
+        })
+        .unwrap_or_else(|| home.to_path_buf())
+}
+
 /// A live session bound to a leaf node.
 struct Session {
     tab: Tab,
@@ -1188,10 +1018,19 @@ enum CtxAction {
     /// Terminal: copy the selection / paste the clipboard.
     Copy,
     Paste,
-    /// Terminal: open the link under the pointer in the default browser.
-    OpenLink,
+    /// Terminal: paste the clipboard and immediately send Enter, so a copied
+    /// command runs without a second click.
+    PasteEnter,
     /// Terminal: web-search the selection (or word under the pointer).
     SearchGoogle,
+    /// Terminal: send Enter (carriage return) to the session, e.g. to submit
+    /// a command already typed at the prompt.
+    Submit,
+    /// Sidebar: forcibly kill the session and close the tab.
+    Close,
+    Group,
+    Ungroup,
+    Rename,
 }
 
 impl CtxAction {
@@ -1201,21 +1040,121 @@ impl CtxAction {
             CtxAction::Stop => "Stop",
             CtxAction::Copy => "Copy",
             CtxAction::Paste => "Paste",
-            CtxAction::OpenLink => "Open Link",
+            CtxAction::PasteEnter => "Paste + Submit",
             CtxAction::SearchGoogle => "Search Google",
+            CtxAction::Submit => "Submit",
+            CtxAction::Close => "Close",
+            CtxAction::Group => "Group",
+            CtxAction::Ungroup => "Ungroup",
+            CtxAction::Rename => "Rename group",
+        }
+    }
+
+    /// Which visual group the item belongs to. Adjacent items in the same group
+    /// sit flush together; a divider is drawn wherever the group changes, so the
+    /// grouping stays right however many conditional items are present.
+    fn group(self) -> u8 {
+        match self {
+            CtxAction::Start | CtxAction::Stop | CtxAction::Close => 0,
+            CtxAction::Group | CtxAction::Ungroup | CtxAction::Rename => 1,
+            CtxAction::Copy | CtxAction::Paste | CtxAction::SearchGoogle => 1,
+            CtxAction::PasteEnter | CtxAction::Submit => 2,
         }
     }
 }
 
+/// A blocking modal overlay. Only ever `Some` under the `licensing` feature —
+/// either the unregistered nag or the key-entry dialog. Drawn centred, dimming
+/// everything behind it, and it swallows all input until dismissed.
+#[cfg(feature = "licensing")]
+enum Modal {
+    /// The "unregistered copy" reminder shown on launch.
+    Nag,
+    /// The license-key entry dialog: the current input buffer and whether the
+    /// last verification attempt failed (drives the error hint).
+    EnterKey { input: String, error: bool },
+}
+
 /// State of an open right-click menu: where it was opened, on which node, and the
-/// items it offers. `target` carries the URL (for `OpenLink`) or search text (for
-/// `SearchGoogle`) captured when the menu opened.
+/// items it offers. `target` carries the search text for `SearchGoogle`,
+/// captured when the menu opened.
 struct CtxMenu {
     x: usize,
     y: usize,
     node: NodeId,
     items: Vec<CtxAction>,
+    enabled: Vec<bool>,
     target: Option<String>,
+}
+
+struct SidebarDrag {
+    pressed: NodeId,
+    start_y: f64,
+    active: bool,
+    collapse_on_click: bool,
+}
+
+/// The sidebar (tab) menu: manage the right-clicked node's session. Fixed —
+/// Start and Stop are no-ops when they don't apply, rather than disappearing,
+/// so the menu doesn't move under the pointer between right-clicks.
+pub(crate) fn sidebar_ctx_items() -> Vec<CtxAction> {
+    vec![
+        CtxAction::Start,
+        CtxAction::Stop,
+        CtxAction::Close,
+        CtxAction::Group,
+        CtxAction::Ungroup,
+        CtxAction::Rename,
+    ]
+}
+
+fn sidebar_action_enabled(
+    tree: &Tree,
+    model: &sidebar::State,
+    action: CtxAction,
+    node: NodeId,
+) -> bool {
+    let command = match action {
+        CtxAction::Group => sidebar::Command::Group,
+        CtxAction::Ungroup => sidebar::Command::Ungroup,
+        CtxAction::Rename => sidebar::Command::Rename,
+        CtxAction::Close => sidebar::Command::Close,
+        _ => return true,
+    };
+    model.can(tree, command, node)
+}
+
+fn terminal_ctx_actions() -> Vec<CtxAction> {
+    vec![
+        CtxAction::Copy,
+        CtxAction::Paste,
+        CtxAction::SearchGoogle,
+        CtxAction::PasteEnter,
+        CtxAction::Submit,
+    ]
+}
+
+fn ctx_sep_count(items: &[CtxAction]) -> usize {
+    items
+        .windows(2)
+        .filter(|w| w[0].group() != w[1].group())
+        .count()
+}
+
+impl CtxMenu {
+    fn is_enabled(&self, i: usize) -> bool {
+        self.enabled.get(i).copied().unwrap_or(true)
+    }
+    /// Item indices *after* which a divider is drawn — every boundary where the
+    /// action group changes (see `CtxAction::group`).
+    fn seps(&self) -> Vec<usize> {
+        self.items
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0].group() != w[1].group())
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 /// Everything that exists once the window is created — or, headlessly, once
@@ -1241,13 +1180,26 @@ struct State {
     sessions: HashMap<NodeId, Session>,
     /// PTY event id -> owning leaf node, for routing parser-thread events.
     id_of: HashMap<u64, NodeId>,
-    selected: NodeId,
-    /// The single background "edit layout" tab (a volatile leaf running nano on
-    /// the config). Pre-warmed at startup and reused by ⌘, / Ctrl+Shift+, so
-    /// there is only ever one; recreated after it auto-closes (nano quit / ⌘W).
+    /// Sidebar controller state (primary selection, range anchor, rename).
+    sidebar: sidebar::State,
+    /// Mouse reorder gesture, promoted from click to drag after a small slop.
+    sidebar_drag: Option<SidebarDrag>,
+    /// The single explicitly opened "edit layout" tab (a volatile leaf running
+    /// nano on the config). Reused while live, so there is only ever one.
     config_node: Option<NodeId>,
     next_id: u64,
     ctx: Option<CtxMenu>,
+    /// The verified license, or `None` for an unregistered copy. Gates the nag.
+    #[cfg(feature = "licensing")]
+    license: Option<license::License>,
+    /// The active blocking modal (nag / key entry), if any.
+    #[cfg(feature = "licensing")]
+    modal: Option<Modal>,
+    /// Index of the modal button the pointer pressed down on (for the sunken
+    /// look), fired on release if the pointer is still over it. `None` = none
+    /// held. Button indices are per-modal (see `App::modal_btn_at`).
+    #[cfg(feature = "licensing")]
+    modal_press: Option<usize>,
     clipboard: Option<arboard::Clipboard>,
     mouse: (f64, f64),
     selecting: bool,
@@ -1315,6 +1267,31 @@ impl State {
             ((self.phys.0 as f64 / s).ceil() as usize).max(1),
             ((self.phys.1 as f64 / s).ceil() as usize).max(1),
         )
+    }
+
+    /// Which modal button (if any) the point falls on. Indices are per-modal:
+    /// Nag `[0=Buy, 1=Enter Key, 2=Continue]`, EnterKey `[0=Verify, 1=Cancel]`.
+    /// One source of truth for both the hover/press draw and the click.
+    #[cfg(feature = "licensing")]
+    fn modal_btn_at(&self, mx: f64, my: f64) -> Option<usize> {
+        let (pw, ph) = self.logical_size();
+        match self.modal {
+            Some(Modal::Nag) => {
+                let (_, btns) = nag_layout(pw, ph);
+                btns.iter().position(|&r| hit(r, mx, my))
+            }
+            Some(Modal::EnterKey { .. }) => {
+                let (_, _, verify, cancel) = enterkey_layout(pw, ph);
+                if hit(verify, mx, my) {
+                    Some(0)
+                } else if hit(cancel, mx, my) {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
     }
 
     /// Pull current physical size + scale off the window (no-op headless).
@@ -1395,7 +1372,11 @@ impl State {
                 &self.link_cells,
             );
             let grid = term.grid();
-            scroll_state = (grid.display_offset(), grid.history_size(), grid.screen_lines());
+            scroll_state = (
+                grid.display_offset(),
+                grid.history_size(),
+                grid.screen_lines(),
+            );
             drop(term);
         } else {
             draw_text(
@@ -1452,20 +1433,27 @@ impl State {
         }
 
         // --- sidebar tree ---------------------------------------------------
-        let sel = self.selected;
-        let rows = self.tree.rows(sel);
+        let sel = self.sidebar.primary();
+        let rows = self.sidebar.rows(&self.tree);
         if sw > 0 {
             // Keep the offset in range as the tree grows/shrinks (folding a
             // group, closing a session) so we never scroll past the last row.
             self.sidebar_scroll = self.sidebar_scroll.min(self.sidebar_max_scroll(&rows));
+            let drop = self.sidebar_drop(&rows);
+            let view = SidebarView {
+                rows: &rows,
+                primary: sel,
+                selection: self.sidebar.selection(),
+                renaming: self.sidebar.rename_node(),
+                hovered: self.sidebar_hover,
+                drop,
+            };
             draw_sidebar(
                 &mut buf,
                 pw,
                 ph,
                 &mut self.renderer,
-                &rows,
-                sel,
-                self.sidebar_hover,
+                &view,
                 sw,
                 self.sidebar_scroll,
             );
@@ -1505,7 +1493,41 @@ impl State {
         if let Some(m) = &self.ctx {
             let hov = ctx_item_at(m, self.mouse.0, self.mouse.1);
             let labels: Vec<&str> = m.items.iter().map(|a| a.label()).collect();
-            draw_ctx_menu(&mut buf, pw, ph, &mut self.renderer, m.x, m.y, &labels, hov);
+            let seps = m.seps();
+            draw_ctx_menu(
+                &mut buf,
+                pw,
+                ph,
+                &mut self.renderer,
+                m.x,
+                m.y,
+                &labels,
+                &m.enabled,
+                &seps,
+                hov,
+            );
+        }
+
+        // --- licensing modal (drawn last: it dims and blocks everything) ----
+        #[cfg(feature = "licensing")]
+        {
+            let (mx, my) = self.mouse;
+            let hover = self.modal_btn_at(mx, my);
+            let press = self.modal_press;
+            match &self.modal {
+                Some(Modal::Nag) => draw_nag(&mut buf, pw, ph, &mut self.renderer, hover, press),
+                Some(Modal::EnterKey { input, error }) => draw_enterkey(
+                    &mut buf,
+                    pw,
+                    ph,
+                    &mut self.renderer,
+                    input,
+                    *error,
+                    hover,
+                    press,
+                ),
+                None => {}
+            }
         }
 
         self.fb = buf;
@@ -1534,7 +1556,8 @@ impl State {
         // Full viewport (incl. the scrollbar gutter) vs. the cell grid (short of
         // it). Backdrop refills the whole viewport; cells clip to the content.
         let view_right = ((term_right(lw, self.inspector) as f64 * sx).round() as usize).min(pw);
-        let clip_right = ((term_content_right(lw, self.inspector) as f64 * sx).round() as usize).min(pw);
+        let clip_right =
+            ((term_content_right(lw, self.inspector) as f64 * sx).round() as usize).min(pw);
         let cell_w = ((self.renderer.cell_w as f64 * sx).round() as usize).max(1);
         let cell_h = ((self.renderer.cell_h as f64 * sy).round() as usize).max(1);
         let font_px = FONT_PX * sy as f32;
@@ -1568,7 +1591,11 @@ impl State {
             &self.link_cells,
         );
         let grid = term.grid();
-        let (offset, history, screen) = (grid.display_offset(), grid.history_size(), grid.screen_lines());
+        let (offset, history, screen) = (
+            grid.display_offset(),
+            grid.history_size(),
+            grid.screen_lines(),
+        );
         drop(term);
         // Scrollbar, redrawn crisply: scale the logical track rect by the device
         // scale so it lands exactly over the gutter the backdrop just refilled.
@@ -1641,11 +1668,13 @@ impl State {
     /// Which leaf's terminal to show: the selection if it is a leaf with a
     /// session, otherwise the first session-bearing leaf under the selection.
     fn shown(&self) -> Option<NodeId> {
-        if self.tree.is_leaf(self.selected) && self.sessions.contains_key(&self.selected) {
-            return Some(self.selected);
+        if self.tree.is_leaf(self.sidebar.primary())
+            && self.sessions.contains_key(&self.sidebar.primary())
+        {
+            return Some(self.sidebar.primary());
         }
         self.tree
-            .leaves(self.selected)
+            .leaves(self.sidebar.primary())
             .into_iter()
             .find(|l| self.sessions.contains_key(l))
     }
@@ -1776,6 +1805,22 @@ impl State {
         Some((row.id, row.is_group))
     }
 
+    /// Turn pointer geometry into an explicit model placement, then validate it
+    /// through the same reducer rule the mouse-up commit uses.
+    fn sidebar_drop(&self, rows: &[Row]) -> Option<sidebar::DropPreview> {
+        if !self.sidebar_drag.as_ref().is_some_and(|drag| drag.active)
+            || self.mouse.0 < 0.0
+            || self.mouse.0 >= self.sidebar_w() as f64
+            || self.mouse.1 < HEADER_H as f64
+        {
+            return None;
+        }
+        let rh = self.renderer.cell_h.max(1);
+        let offset = (self.mouse.1 as usize - HEADER_H) + self.sidebar_scroll;
+        let placement = sidebar_drop_placement(rows, rh, offset);
+        self.sidebar.drop_preview(&self.tree, placement)
+    }
+
     /// Largest sidebar scroll offset (logical px, a multiple of the row height)
     /// that still leaves the last tree row reachable at the bottom of the pane.
     /// `0` when the whole tree already fits, which disables sidebar scrolling.
@@ -1839,6 +1884,13 @@ impl State {
         word_at(&term, point)
     }
 
+    /// The terminal-content menu, plus the search target captured when it opens.
+    /// Clipboard/search actions are followed by a divider, then the two submit
+    /// actions. Licensing controls deliberately do not appear here.
+    pub(crate) fn term_ctx_items(&self) -> (Vec<CtxAction>, Option<String>) {
+        (terminal_ctx_actions(), self.search_target())
+    }
+
     /// Recompute the hover link highlight from the current pointer position.
     /// Returns true if the set of highlighted cells changed (so the caller can
     /// repaint). The link under the pointer is always underlined — no modifier
@@ -1860,6 +1912,9 @@ impl State {
     /// live (Ctrl-held) link, a resize arrow over a window grip, else the
     /// default arrow.
     fn desired_cursor(&self, pw: usize, ph: usize) -> CursorIcon {
+        if self.sidebar_drag.as_ref().is_some_and(|drag| drag.active) {
+            return CursorIcon::Grabbing;
+        }
         // A link is always underlined on hover, but the hand cursor only appears
         // while Ctrl is held — that's the state in which a click opens it.
         if self.mods.control_key() && !self.link_cells.is_empty() {
@@ -1898,7 +1953,10 @@ fn is_url_char(c: char) -> bool {
 /// closing brackets that almost always belong to the surrounding prose, not the
 /// link (e.g. `see https://x.com.` or `(https://x.com)`).
 fn is_url_trailer(c: char) -> bool {
-    matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '>')
+    matches!(
+        c,
+        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '>'
+    )
 }
 
 /// Assemble the full logical line `point` sits on, following the `WRAPLINE`
@@ -1998,7 +2056,10 @@ fn url_at(term: &Term<Listener>, point: Point) -> Option<(String, Vec<Point>)> {
 
     // Otherwise look for a bare URL in the text.
     let (start, end) = find_url(&chars, hover)?;
-    Some((chars[start..end].iter().collect(), points[start..end].to_vec()))
+    Some((
+        chars[start..end].iter().collect(),
+        points[start..end].to_vec(),
+    ))
 }
 
 /// Locate the URL covering character index `hover` within `chars`, returning its
@@ -2080,7 +2141,10 @@ fn find_path(chars: &[char], hover: usize) -> Option<(usize, usize)> {
 fn path_at(term: &Term<Listener>, point: Point) -> Option<(String, Vec<Point>)> {
     let (chars, points, _, hover) = logical_line(term, point)?;
     let (start, end) = find_path(&chars, hover)?;
-    Some((chars[start..end].iter().collect(), points[start..end].to_vec()))
+    Some((
+        chars[start..end].iter().collect(),
+        points[start..end].to_vec(),
+    ))
 }
 
 /// Resolve a path candidate to something openable, or `None` if it doesn't
@@ -2112,7 +2176,10 @@ fn open_url(url: &str) {
 
 /// Open a Google web search for `query` in the user's default browser.
 fn open_search(query: &str) {
-    open_url(&format!("https://www.google.com/search?q={}", urlencode(query)));
+    open_url(&format!(
+        "https://www.google.com/search?q={}",
+        urlencode(query)
+    ));
 }
 
 /// Percent-encode `s` for use in a URL query (RFC 3986 unreserved set kept
@@ -2136,8 +2203,7 @@ struct App {
     /// The window's pixel surface. Lives here (not on `State`) so the
     /// headless harness can own a `State` with no surface at all.
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
-    /// Where the workspace tree is loaded from (CLI arg, or the default
-    /// `~/.termspace/workspace01`). Read-only — the app never writes it back.
+    /// Where the workspace tree is loaded from and sidebar edits are saved.
     ws_path: PathBuf,
     /// The window is created hidden and revealed once, after the first frame
     /// is presented, so no blank surface flashes on open.
@@ -2149,6 +2215,81 @@ struct App {
 }
 
 impl App {
+    fn save_layout(&self) {
+        if let Some(st) = &self.state {
+            if let Err(e) = save_workspace(&self.ws_path, &st.tree) {
+                eprintln!("termset: could not save {}: {e}", self.ws_path.display());
+            }
+        }
+    }
+
+    /// Run one pure sidebar transition, then execute only the effects it asks
+    /// for. This is the shell/controller boundary: reducer code cannot touch
+    /// the window or disk, and event handlers cannot mutate sidebar state.
+    fn dispatch_sidebar(&mut self, action: sidebar::Action) -> sidebar::Outcome {
+        let outcome = match self.state.as_mut() {
+            Some(st) => {
+                let outcome = st.sidebar.dispatch(&mut st.tree, action);
+                if let Some(caret) = outcome.caret {
+                    st.caret = caret;
+                }
+                if outcome.redraw {
+                    st.request_redraw();
+                }
+                outcome
+            }
+            None => sidebar::Outcome::default(),
+        };
+        if outcome.persist {
+            self.save_layout();
+        }
+        outcome
+    }
+
+    fn group_selected(&mut self) {
+        self.dispatch_sidebar(sidebar::Action::Group);
+    }
+
+    fn ungroup_selected(&mut self) {
+        self.dispatch_sidebar(sidebar::Action::Ungroup);
+    }
+
+    /// Move the selected layers before/after a row, or into a group when the
+    /// group header itself is the target. Groups remain top-level.
+    fn reorder_selected(&mut self, placement: Placement) {
+        self.dispatch_sidebar(sidebar::Action::Reorder(placement));
+    }
+
+    fn begin_group_rename(&mut self, node: NodeId) {
+        self.dispatch_sidebar(sidebar::Action::BeginRename(node));
+    }
+
+    fn edit_sidebar_rename(&mut self, key: &Key, text: Option<&str>) -> bool {
+        let Some(caret) = self.state.as_ref().map(|st| st.caret) else {
+            return false;
+        };
+        if !self.state.as_ref().unwrap().sidebar.is_renaming() {
+            return false;
+        }
+        let input = match key {
+            Key::Named(NamedKey::Escape) => sidebar::RenameInput::Cancel,
+            Key::Named(NamedKey::Enter) => sidebar::RenameInput::Commit,
+            Key::Named(NamedKey::Backspace) => sidebar::RenameInput::Backspace,
+            Key::Named(NamedKey::Delete) => sidebar::RenameInput::Delete,
+            Key::Named(NamedKey::ArrowLeft) => sidebar::RenameInput::Left,
+            Key::Named(NamedKey::ArrowRight) => sidebar::RenameInput::Right,
+            Key::Named(NamedKey::Home) => sidebar::RenameInput::Home,
+            Key::Named(NamedKey::End) => sidebar::RenameInput::End,
+            Key::Named(NamedKey::Space) => sidebar::RenameInput::Insert(' '),
+            _ => match text.and_then(|s| s.chars().next()) {
+                Some(c) if !c.is_control() => sidebar::RenameInput::Insert(c),
+                _ => return true,
+            },
+        };
+        self.dispatch_sidebar(sidebar::Action::Rename { input, caret });
+        true
+    }
+
     /// Run a session-lifecycle plan: spawn/run/sigint each action in order.
     fn apply(&mut self, acts: Vec<Action>) {
         for act in acts {
@@ -2190,7 +2331,9 @@ impl App {
     fn spawn_for(&mut self, node: NodeId) {
         let base = layout_dir(&self.ws_path);
         let backend = self.backend_for(node);
-        let Some(st) = self.state.as_mut() else { return };
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
         if st.sessions.contains_key(&node) {
             return;
         }
@@ -2215,7 +2358,13 @@ impl App {
             backend,
         );
         st.id_of.insert(id, node);
-        st.sessions.insert(node, Session { tab, shell_pid: pid });
+        st.sessions.insert(
+            node,
+            Session {
+                tab,
+                shell_pid: pid,
+            },
+        );
     }
 
     fn send_to(&self, node: NodeId, bytes: Vec<u8>) {
@@ -2232,7 +2381,9 @@ impl App {
     /// no scrollback) it instead sends arrow keys, the usual "alternate
     /// scroll".
     fn scroll(&mut self, delta: f64) {
-        let Some(st) = self.state.as_mut() else { return };
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
         let Some(node) = st.shown() else { return };
         st.scroll_acc += delta;
         let lines = st.scroll_acc.trunc() as i32;
@@ -2266,9 +2417,11 @@ impl App {
     /// whole row is scrolled once it adds up. The offset stays a multiple of the
     /// row height, so rows never straddle the header. No scrollbar is drawn.
     fn scroll_sidebar(&mut self, delta: f64) {
-        let Some(st) = self.state.as_mut() else { return };
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
         let rh = st.renderer.cell_h.max(1);
-        let rows = st.tree.rows(st.selected);
+        let rows = st.tree.rows(st.sidebar.primary());
         let max = st.sidebar_max_scroll(&rows);
         if max == 0 {
             st.sidebar_scroll = 0;
@@ -2327,16 +2480,19 @@ impl App {
 
     /// Create a scratch session under the group of the current selection (a
     /// selected group is its own target; Scratch/Transient are valid). It
-    /// inherits the selected leaf's directory, else `$HOME`.
+    /// inherits the selected tab's live shell cwd, falling back to the leaf's
+    /// configured directory and then `$HOME` when no live cwd is available.
     fn new_scratch(&mut self) {
-        let Some(st) = self.state.as_mut() else { return };
-        let group = st.tree.group_for_new(st.selected);
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
+        let group = st.tree.group_for_new(st.sidebar.primary());
         let home = home_dir();
-        let cwd = st
-            .tree
-            .leaf_spec(st.selected)
-            .map(|(w, _)| w.to_path_buf())
-            .unwrap_or(home);
+        let live_cwd = st
+            .sessions
+            .get(&st.sidebar.primary())
+            .and_then(|session| proc_cwd(session.shell_pid));
+        let cwd = new_tab_workdir(&st.tree, st.sidebar.primary(), live_cwd, &home);
         let n = st.tree.nodes[group].children.len() + 1;
         let node = st.tree.push(
             Some(group),
@@ -2348,7 +2504,8 @@ impl App {
             true,
         );
         st.tree.nodes[group].expanded = true;
-        st.selected = node;
+        st.sidebar
+            .dispatch(&mut st.tree, sidebar::Action::SelectOnly(node));
         self.spawn_for(node);
         if let Some(st) = &self.state {
             st.request_redraw();
@@ -2363,8 +2520,8 @@ impl App {
     /// in the sidebar, not inside any section, never written back into the
     /// layout). It runs nano via `exec`, so quitting nano ends the PTY and the
     /// dynamic session auto-closes — after which the next call recreates it.
-    /// Pre-warmed at startup, but hidden from the sidebar until it is the active
-    /// (selected) tab (see `Tree::rows`), so it stays ready without cluttering.
+    /// Created lazily by the explicit Edit Layout action and hidden from the
+    /// sidebar unless it is the active tab (see `Tree::rows`).
     fn ensure_config_node(&mut self) -> Option<NodeId> {
         // Reuse the existing session while it is still live.
         if let Some(st) = self.state.as_ref() {
@@ -2380,7 +2537,9 @@ impl App {
         // the dynamic session auto-closes (see the `UserEvent::Exit` handler).
         let command = format!("exec nano {}", shell_quote(&path));
         let node = {
-            let Some(st) = self.state.as_mut() else { return None };
+            let Some(st) = self.state.as_mut() else {
+                return None;
+            };
             let root = st.tree.root;
             let id = st.tree.push(
                 Some(root),
@@ -2404,14 +2563,18 @@ impl App {
     /// creating it if needed. The terminal equivalent of an editor's ⌘,: there
     /// is no separate settings UI, the YAML file *is* the layout. Edits load on
     /// the next launch (the running app does not live-apply them, and never
-    /// writes the file back — it is yours to edit).
+    /// writes from the editor can coexist with sidebar auto-saves only while
+    /// the editor buffer is current).
     fn edit_layout(&mut self) {
-        let Some(node) = self.ensure_config_node() else { return };
+        let Some(node) = self.ensure_config_node() else {
+            return;
+        };
         if let Some(st) = self.state.as_mut() {
             if let Some(p) = st.tree.nodes[node].parent {
                 st.tree.nodes[p].expanded = true; // reveal it in the sidebar
             }
-            st.selected = node;
+            st.sidebar
+                .dispatch(&mut st.tree, sidebar::Action::SelectOnly(node));
             st.focus = None;
             st.request_redraw();
         }
@@ -2425,15 +2588,44 @@ impl App {
     /// a scratch tab means discarding it; detaching would strand invisible
     /// sessions on the server).
     fn close_selected(&mut self) {
-        let Some(st) = self.state.as_mut() else { return };
-        let node = st.selected;
+        let Some(node) = self.state.as_ref().and_then(|st| {
+            let node = st.sidebar.primary();
+            st.sidebar
+                .can(&st.tree, sidebar::Command::Close, node)
+                .then_some(node)
+        }) else {
+            return;
+        };
+        self.close(node, false);
+    }
+
+    /// Close `node`, killing its process/session when `force` is set. The
+    /// regular close shortcut preserves persistent tmux sessions; the sidebar
+    /// context menu deliberately does not.
+    fn close(&mut self, node: NodeId, force: bool) {
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
         if let Some(s) = st.sessions.remove(&node) {
             match &s.tab.io {
                 Io::Pty(tx) => {
+                    #[cfg(unix)]
+                    if force && s.shell_pid != 0 {
+                        // The shell is the PTY session/process-group leader.
+                        // A negative pid kills it and every process running in
+                        // that terminal, including a foreground child.
+                        unsafe {
+                            if libc::kill(-(s.shell_pid as i32), libc::SIGKILL) == -1 {
+                                // Defensive fallback if the platform did not
+                                // make the shell its process-group leader.
+                                libc::kill(s.shell_pid as i32, libc::SIGKILL);
+                            }
+                        }
+                    }
                     let _ = tx.send(Msg::Shutdown);
                 }
                 Io::Tmux(c) => {
-                    if st.tree.nodes[node].dynamic {
+                    if force || st.tree.nodes[node].dynamic {
                         c.kill_session();
                     } else {
                         c.detach();
@@ -2445,13 +2637,8 @@ impl App {
         }
         let removed = st.tree.nodes[node].dynamic;
         if removed {
-            if let Some(p) = st.tree.nodes[node].parent {
-                // Land on the preceding session; fall back to the parent only
-                // when there is no sibling before this one.
-                let target = st.tree.prev_sibling(node).unwrap_or(p);
-                st.tree.nodes[p].children.retain(|&c| c != node);
-                st.selected = target;
-            }
+            st.sidebar
+                .dispatch(&mut st.tree, sidebar::Action::Remove(node));
         }
         st.request_redraw();
     }
@@ -2463,29 +2650,28 @@ impl App {
     /// tabs cycle. A selection that isn't currently visible (its group is
     /// collapsed) snaps back to the first row.
     fn select_relative(&mut self, delta: i32) {
-        let Some(st) = self.state.as_mut() else { return };
-        let rows = st.tree.rows(st.selected);
-        if rows.is_empty() {
-            return;
+        let outcome = self.dispatch_sidebar(sidebar::Action::SelectRelative(delta));
+        if outcome.redraw {
+            if let Some(st) = self.state.as_mut() {
+                st.focus = None;
+            }
         }
-        let next = match rows.iter().position(|r| r.id == st.selected) {
-            Some(i) => (i as i32 + delta).rem_euclid(rows.len() as i32) as usize,
-            None => 0,
-        };
-        st.selected = rows[next].id;
-        st.focus = None;
-        st.request_redraw();
     }
 
     /// Fold (⌘←/Ctrl+Shift+←) or unfold (⌘→/Ctrl+Shift+→) the selected group.
     /// A no-op when a leaf is selected — leaves have nothing to expand — so the
     /// keystroke is simply swallowed rather than leaking to the PTY.
     fn set_group_expanded(&mut self, open: bool) {
-        let Some(st) = self.state.as_mut() else { return };
-        if !st.tree.is_group(st.selected) {
+        if !GROUP_TOGGLE_ENABLED {
             return;
         }
-        st.tree.nodes[st.selected].expanded = open;
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
+        if !st.tree.is_group(st.sidebar.primary()) {
+            return;
+        }
+        st.tree.nodes[st.sidebar.primary()].expanded = open;
         st.request_redraw();
     }
 
@@ -2493,7 +2679,9 @@ impl App {
     /// is shared, so a resize *or* an inspector toggle reflows them all (not
     /// just the visible one) to keep background sessions sane.
     fn relayout(&mut self) {
-        let Some(st) = self.state.as_mut() else { return };
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
         st.sync_metrics();
         let (lw, lh) = st.logical_size();
         let size = st.grid_size(lw, lh);
@@ -2562,8 +2750,10 @@ impl App {
     /// Pin the selected leaf's default working directory to its session's
     /// *current* shell cwd (where you've `cd`'d to).
     fn use_current_cwd(&mut self) {
-        let Some(st) = self.state.as_mut() else { return };
-        let sel = st.selected;
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
+        let sel = st.sidebar.primary();
         let Some(pid) = st.sessions.get(&sel).map(|s| s.shell_pid) else {
             return;
         };
@@ -2576,8 +2766,10 @@ impl App {
     /// Focus an inspector field, placing the caret under the click. Fields
     /// with no text for the selection (Command/Dir on a group) refuse focus.
     fn focus_field(&mut self, f: Field, click_x: f64) {
-        let Some(st) = self.state.as_mut() else { return };
-        let Some(text) = st.tree.field_text(st.selected, f) else {
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
+        let Some(text) = st.tree.field_text(st.sidebar.primary(), f) else {
             st.focus = None;
             return;
         };
@@ -2593,9 +2785,11 @@ impl App {
     /// straight back into the tree (the tree is the single source of truth).
     /// Returns `true` if the key was consumed (kept off the PTY).
     fn edit_focused(&mut self, key: &Key, text_in: Option<&str>) -> bool {
-        let Some(st) = self.state.as_mut() else { return false };
+        let Some(st) = self.state.as_mut() else {
+            return false;
+        };
         let Some(f) = st.focus else { return false };
-        let sel = st.selected;
+        let sel = st.sidebar.primary();
         let e = match key {
             Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
                 st.focus = None;
@@ -2635,7 +2829,7 @@ impl App {
         let cur = st.tree.field_text(sel, f).unwrap_or_default();
         let (next, caret) = apply_edit(&cur, st.caret, e);
         match f {
-            Field::Title => st.tree.nodes[sel].name = next,
+            Field::Title => st.tree.set_name(sel, next),
             Field::Command => {
                 if let Some(c) = st.tree.command_mut(sel) {
                     *c = next;
@@ -2657,7 +2851,12 @@ impl App {
     /// top, so nothing looks doubled or soft. The harness skips this and reads
     /// `State::fb` directly. Non-HiDPI is a straight copy.
     fn redraw(&mut self) {
-        let App { state, surface, revealed, .. } = self;
+        let App {
+            state,
+            surface,
+            revealed,
+            ..
+        } = self;
         let (Some(st), Some(surface)) = (state.as_mut(), surface.as_mut()) else {
             return;
         };
@@ -2686,7 +2885,9 @@ impl App {
     }
 
     fn send(&self, bytes: Vec<u8>) {
-        let Some(st) = self.state.as_ref() else { return };
+        let Some(st) = self.state.as_ref() else {
+            return;
+        };
         let Some(node) = st.shown() else { return };
         // Typing snaps back to the prompt if we were scrolled up, like xterm.
         let mut term = st.sessions[&node].tab.term.lock();
@@ -2700,8 +2901,127 @@ impl App {
         self.send_to(node, bytes);
     }
 
+    /// Route a keystroke into the open key-entry modal. Enter verifies, Escape
+    /// cancels, Ctrl/⌘+V pastes the clipboard, and printable characters append.
+    #[cfg(feature = "licensing")]
+    fn modal_key_input(&mut self, key: &Key, text: Option<&str>) {
+        let mods = self.state.as_ref().map(|s| s.mods).unwrap_or_default();
+        let paste = mods.control_key() || mods.super_key();
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
+        let Some(Modal::EnterKey { input, error }) = st.modal.as_mut() else {
+            return;
+        };
+
+        // Decide the action while borrowing the buffer, then act after the
+        // borrow ends (verifying mutates other State fields).
+        enum Act {
+            None,
+            Cancel,
+            Verify(String),
+        }
+        let act = match key {
+            Key::Named(NamedKey::Escape) => Act::Cancel,
+            Key::Named(NamedKey::Enter) => Act::Verify(input.clone()),
+            Key::Named(NamedKey::Backspace) => {
+                input.pop();
+                *error = false;
+                Act::None
+            }
+            Key::Named(NamedKey::Space) => {
+                input.push(' ');
+                Act::None
+            }
+            Key::Character(c) if paste && c.eq_ignore_ascii_case("v") => {
+                if let Some(t) = st.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
+                    if let Some(Modal::EnterKey { input, error }) = st.modal.as_mut() {
+                        input.push_str(t.trim());
+                        *error = false;
+                    }
+                }
+                Act::None
+            }
+            // Ignore other modified chords (e.g. ⌘Q handled elsewhere).
+            Key::Character(_) if paste => Act::None,
+            Key::Character(c) => {
+                // Prefer the composed `text` (respects the keyboard layout /
+                // shift state); fall back to the raw key character.
+                input.push_str(text.unwrap_or(c));
+                *error = false;
+                Act::None
+            }
+            _ => Act::None,
+        };
+        match act {
+            Act::None => {}
+            Act::Cancel => st.modal = None,
+            Act::Verify(k) => match license::save_license(&k) {
+                Some(lic) => {
+                    st.license = Some(lic);
+                    st.modal = None;
+                }
+                None => {
+                    if let Some(Modal::EnterKey { error, .. }) = st.modal.as_mut() {
+                        *error = true;
+                    }
+                }
+            },
+        }
+        if let Some(st) = self.state.as_ref() {
+            st.request_redraw();
+        }
+    }
+
+    /// Fire the action for modal button `idx` (from [`State::modal_btn_at`]),
+    /// called on mouse-release over the same button that was pressed.
+    #[cfg(feature = "licensing")]
+    fn fire_modal_btn(&mut self, idx: usize) {
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
+        match st.modal {
+            // [0=Buy, 1=Enter Key, 2=Continue]. Buy leaves the nag up so the
+            // buyer can come back and enter the key without reopening it.
+            Some(Modal::Nag) => match idx {
+                0 => open_url(license::BUY_URL),
+                1 => {
+                    st.modal = Some(Modal::EnterKey {
+                        input: String::new(),
+                        error: false,
+                    })
+                }
+                _ => st.modal = None,
+            },
+            // [0=Verify, 1=Cancel].
+            Some(Modal::EnterKey { .. }) => match idx {
+                0 => {
+                    let key = match &st.modal {
+                        Some(Modal::EnterKey { input, .. }) => input.clone(),
+                        _ => String::new(),
+                    };
+                    match license::save_license(&key) {
+                        Some(lic) => {
+                            st.license = Some(lic);
+                            st.modal = None;
+                        }
+                        None => {
+                            if let Some(Modal::EnterKey { error, .. }) = st.modal.as_mut() {
+                                *error = true;
+                            }
+                        }
+                    }
+                }
+                _ => st.modal = None,
+            },
+            None => {}
+        }
+    }
+
     fn copy_to_clipboard(&mut self) {
-        let Some(st) = self.state.as_mut() else { return };
+        let Some(st) = self.state.as_mut() else {
+            return;
+        };
         let Some(node) = st.shown() else { return };
         let text = st.sessions[&node].tab.term.lock().selection_to_string();
         if let (Some(text), Some(cb)) = (text, st.clipboard.as_mut()) {
@@ -2723,7 +3043,6 @@ impl App {
     }
 }
 
-
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -2735,7 +3054,6 @@ fn home_dir() -> PathBuf {
 fn shell_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
 }
-
 
 /// Tell X11/the compositor the window is fully opaque and clear its backing to
 /// black, before it's mapped. Without this, a freshly-mapped compositor-redirected
@@ -2830,9 +3148,7 @@ impl ApplicationHandler<UserEvent> for App {
             attrs = WindowAttributesExtX11::with_name(attrs, "termset", "termset");
             attrs = WindowAttributesExtWayland::with_name(attrs, "termset", "termset");
         }
-        let window = Rc::new(
-            event_loop.create_window(attrs).expect("create window"),
-        );
+        let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
         // Mark the X11 window opaque + black-backed *before* it maps, so the
         // compositor's first composite of it is a flat dark frame rather than a
         // see-through hole onto the desktop while our pixels are still in flight.
@@ -2882,6 +3198,18 @@ impl ApplicationHandler<UserEvent> for App {
         };
         let tree = parse_workspace(&ws_text, &home);
 
+        // Licensing: load any stored key, then bump the launch counter and
+        // decide whether this launch shows the unregistered nag.
+        #[cfg(feature = "licensing")]
+        let license = license::load_license();
+        #[cfg(feature = "licensing")]
+        if let Some(l) = &license {
+            eprintln!("termset: registered to {} <{}>", l.name, l.email);
+        }
+        #[cfg(feature = "licensing")]
+        let modal = license::bump_launch_and_should_nag(license.is_some()).then_some(Modal::Nag);
+
+        let selected = tree.first_leaf(tree.root).unwrap_or(tree.root);
         let inner = window.inner_size();
         let st = State {
             phys: (inner.width as usize, inner.height as usize),
@@ -2889,15 +3217,20 @@ impl ApplicationHandler<UserEvent> for App {
             window: Some(window),
             fb: Vec::new(),
             renderer,
-            selected: tree
-                .first_leaf(tree.root)
-                .unwrap_or(tree.root),
+            sidebar: sidebar::State::new(selected),
+            sidebar_drag: None,
             tree,
             sessions: HashMap::new(),
             id_of: HashMap::new(),
             config_node: None,
             next_id: 0,
             ctx: None,
+            #[cfg(feature = "licensing")]
+            license,
+            #[cfg(feature = "licensing")]
+            modal,
+            #[cfg(feature = "licensing")]
+            modal_press: None,
             clipboard: arboard::Clipboard::new().ok(),
             mouse: (0.0, 0.0),
             selecting: false,
@@ -2973,14 +3306,19 @@ impl ApplicationHandler<UserEvent> for App {
                 backend,
             );
             st.id_of.insert(id, node);
-            st.sessions.insert(node, Session { tab, shell_pid: pid });
+            st.sessions.insert(
+                node,
+                Session {
+                    tab,
+                    shell_pid: pid,
+                },
+            );
         }
         st.request_redraw();
 
-        // Pre-warm the "Edit Config" session (nano on the config) in the
-        // background. It's hidden from the sidebar until it's the active tab
-        // (see `Tree::rows`), so ⌘, / Ctrl+Shift+, reveals an already-open nano.
-        self.ensure_config_node();
+        // The YAML editor is opened lazily by the explicit Edit Layout action.
+        // Keeping a hidden nano buffer alive here would let it overwrite newer
+        // sidebar auto-saves with stale content.
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -3001,18 +3339,13 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         st.id_of.remove(&id);
-                        // A scratch tab disappears when its shell exits; a
-                        // spec leaf stays so Start can bring it back. The layout
-                        // file is left untouched — the app never writes it.
-                        if st.tree.nodes[node].dynamic {
-                            if let Some(p) = st.tree.nodes[node].parent {
-                                let target = st.tree.prev_sibling(node).unwrap_or(p);
-                                st.tree.nodes[p].children.retain(|&c| c != node);
-                                if st.selected == node {
-                                    st.selected = target;
-                                }
-                            }
-                        }
+                        // A shell that exits naturally (including Ctrl+D)
+                        // closes its live tab, regardless of whether it came
+                        // from the layout or was created at runtime. The layout
+                        // file remains untouched, so configured tabs return on
+                        // the next launch.
+                        st.sidebar
+                            .dispatch(&mut st.tree, sidebar::Action::Remove(node));
                         st.request_redraw();
                     }
                 }
@@ -3039,8 +3372,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::PtyWrite(id, bytes) => {
-                if let Some(node) =
-                    self.state.as_ref().and_then(|st| st.id_of.get(&id).copied())
+                if let Some(node) = self
+                    .state
+                    .as_ref()
+                    .and_then(|st| st.id_of.get(&id).copied())
                 {
                     self.send_to(node, bytes);
                 }
@@ -3133,7 +3468,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     // Sidebar row hover: a faint fill follows the pointer down
                     // the tree. Repaint only when the row under it changes.
-                    let rows = st.tree.rows(st.selected);
+                    let rows = st.tree.rows(st.sidebar.primary());
                     let row_hover = st
                         .sidebar_hit(st.mouse.0, st.mouse.1, &rows)
                         .map(|(id, _)| id);
@@ -3141,9 +3476,25 @@ impl ApplicationHandler<UserEvent> for App {
                         st.sidebar_hover = row_hover;
                         st.request_redraw();
                     }
+                    if let Some(drag) = st.sidebar_drag.as_mut() {
+                        if !drag.active && (st.mouse.1 - drag.start_y).abs() >= 4.0 {
+                            drag.active = true;
+                            st.request_redraw();
+                        }
+                    }
+                    if st.sidebar_drag.as_ref().is_some_and(|drag| drag.active) {
+                        st.apply_cursor();
+                        st.request_redraw();
+                    }
                     // Repaint while a context menu is open so its hover bar
                     // tracks the pointer.
                     if st.ctx.is_some() {
+                        st.request_redraw();
+                    }
+                    // Repaint while a licensing modal is open so its buttons
+                    // light up under the pointer.
+                    #[cfg(feature = "licensing")]
+                    if st.modal.is_some() {
                         st.request_redraw();
                     }
                     if st.selecting {
@@ -3166,15 +3517,30 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let Some(stref) = self.state.as_ref() else { return };
+                let Some(stref) = self.state.as_ref() else {
+                    return;
+                };
                 let (mx, my) = stref.mouse;
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => {
+                        // A licensing modal is on top of everything: arm the
+                        // button under the pointer (drawn sunken) and consume
+                        // the press; it fires on release. See the Released arm.
+                        #[cfg(feature = "licensing")]
+                        if self.state.as_ref().is_some_and(|s| s.modal.is_some()) {
+                            let idx = self.state.as_ref().unwrap().modal_btn_at(mx, my);
+                            let st = self.state.as_mut().unwrap();
+                            st.modal_press = idx;
+                            st.request_redraw();
+                            return;
+                        }
                         let (pw, ph) = self.state.as_ref().unwrap().logical_size();
 
                         // 1. A click anywhere resolves an open context menu.
                         if let Some(m) = &self.state.as_ref().unwrap().ctx {
-                            let pick = ctx_item_at(m, mx, my).map(|i| m.items[i]);
+                            let pick = ctx_item_at(m, mx, my)
+                                .filter(|&i| m.is_enabled(i))
+                                .map(|i| m.items[i]);
                             let node = m.node;
                             let target = m.target.clone();
                             self.state.as_mut().unwrap().ctx = None;
@@ -3183,16 +3549,20 @@ impl ApplicationHandler<UserEvent> for App {
                                 Some(CtxAction::Stop) => self.stop(node),
                                 Some(CtxAction::Copy) => self.copy_to_clipboard(),
                                 Some(CtxAction::Paste) => self.paste(),
-                                Some(CtxAction::OpenLink) => {
-                                    if let Some(url) = target {
-                                        open_url(&url);
-                                    }
+                                Some(CtxAction::PasteEnter) => {
+                                    self.paste();
+                                    self.send(b"\r".to_vec());
                                 }
                                 Some(CtxAction::SearchGoogle) => {
                                     if let Some(q) = target {
                                         open_search(&q);
                                     }
                                 }
+                                Some(CtxAction::Submit) => self.send(b"\r".to_vec()),
+                                Some(CtxAction::Close) => self.close(node, true),
+                                Some(CtxAction::Group) => self.group_selected(),
+                                Some(CtxAction::Ungroup) => self.ungroup_selected(),
+                                Some(CtxAction::Rename) => self.begin_group_rename(node),
                                 None => {}
                             }
                             if let Some(st) = &self.state {
@@ -3219,13 +3589,12 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         // 3. Inspector pane: focus a field, else defocus.
-                        if self.state.as_ref().unwrap().inspector
-                            && mx >= panel_x(pw) as f64
-                        {
+                        if self.state.as_ref().unwrap().inspector && mx >= panel_x(pw) as f64 {
                             let ch = self.state.as_ref().unwrap().renderer.cell_h;
                             let rects = field_rects(pw, ch);
-                            if let Some(f) =
-                                Field::ALL.into_iter().find(|f| hit(rects[f.index()], mx, my))
+                            if let Some(f) = Field::ALL
+                                .into_iter()
+                                .find(|f| hit(rects[f.index()], mx, my))
                             {
                                 self.focus_field(f, mx);
                             } else if hit(usecwd_btn(pw, ch), mx, my) {
@@ -3237,7 +3606,9 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         // 4. Borderless-window resize grips.
-                        if let Some(dir) = resize_dir(pw, ph, self.state.as_ref().unwrap().inspector, mx, my) {
+                        if let Some(dir) =
+                            resize_dir(pw, ph, self.state.as_ref().unwrap().inspector, mx, my)
+                        {
                             if let Some(w) = &self.state.as_ref().unwrap().window {
                                 let _ = w.drag_resize_window(dir);
                             }
@@ -3273,16 +3644,23 @@ impl ApplicationHandler<UserEvent> for App {
                         // smoothly. Swallows the click (the gutter is its own
                         // space) even with no scrollback.
                         {
-                            let rect = scrollbar_rect(pw, ph, self.state.as_ref().unwrap().inspector);
-                            if hit(rect, mx, my) {
-                                let (_, area_y, _, area_h) = rect;
+                            let gutter = scrollbar_gutter_rect(
+                                pw,
+                                ph,
+                                self.state.as_ref().unwrap().inspector,
+                            );
+                            if hit(gutter, mx, my) {
+                                let (_, area_y, _, area_h) =
+                                    scrollbar_rect(pw, ph, self.state.as_ref().unwrap().inspector);
                                 let grab = self
                                     .state
                                     .as_ref()
                                     .unwrap()
                                     .scroll_metrics()
                                     .map(|(off, hist, scr)| {
-                                        let (top, th) = scrollbar_thumb(area_y, area_h, off, hist, scr, SBAR_MIN);
+                                        let (top, th) = scrollbar_thumb(
+                                            area_y, area_h, off, hist, scr, SBAR_MIN,
+                                        );
                                         if my >= top as f64 && my < (top + th) as f64 {
                                             my - top as f64 // anchored drag on the thumb
                                         } else {
@@ -3296,20 +3674,28 @@ impl ApplicationHandler<UserEvent> for App {
                                 return;
                             }
                         }
-                        // 6. Sidebar: a click selects the row; a group click
-                        // also folds/unfolds it (there is no separate expander).
-                        let sel = self.state.as_ref().unwrap().selected;
-                        let rows = self.state.as_ref().unwrap().tree.rows(sel);
-                        if let Some((node, is_group)) =
+                        // 6. Sidebar: Shift-click extends the selection across
+                        // visible rows, matching layer-list selection in Figma.
+                        let rows = {
+                            let st = self.state.as_ref().unwrap();
+                            st.sidebar.rows(&st.tree)
+                        };
+                        if let Some((node, _is_group)) =
                             self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
                         {
+                            let shift = self.state.as_ref().unwrap().mods.shift_key();
+                            let outcome = self.dispatch_sidebar(sidebar::Action::Press {
+                                target: node,
+                                extend: shift,
+                            });
                             let st = self.state.as_mut().unwrap();
-                            st.selected = node;
                             st.focus = None;
-                            if is_group {
-                                let e = &mut st.tree.nodes[node].expanded;
-                                *e = !*e;
-                            }
+                            st.sidebar_drag = Some(SidebarDrag {
+                                pressed: node,
+                                start_y: my,
+                                active: false,
+                                collapse_on_click: outcome.collapse_on_click,
+                            });
                             st.request_redraw();
                             return;
                         }
@@ -3329,10 +3715,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // only — the scrollbar gutter was handled in step 5b).
                         let tr = term_content_right(pw, self.state.as_ref().unwrap().inspector);
                         let sw = self.state.as_ref().unwrap().sidebar_w();
-                        if mx >= sw as f64
-                            && (mx as usize) < tr
-                            && my >= HEADER_H as f64
-                        {
+                        if mx >= sw as f64 && (mx as usize) < tr && my >= HEADER_H as f64 {
                             if let Some(node) = self.state.as_ref().unwrap().shown() {
                                 let now = std::time::Instant::now();
                                 let st = self.state.as_mut().unwrap();
@@ -3359,6 +3742,60 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     (MouseButton::Left, ElementState::Released) => {
+                        // Modal button release: fire only if the pointer is
+                        // still over the button that was pressed (standard push-
+                        // button behaviour — release-off cancels).
+                        #[cfg(feature = "licensing")]
+                        if self.state.as_ref().is_some_and(|s| s.modal.is_some()) {
+                            let over = self.state.as_ref().unwrap().modal_btn_at(mx, my);
+                            let pressed = self.state.as_mut().unwrap().modal_press.take();
+                            if let (Some(p), Some(o)) = (pressed, over) {
+                                if p == o {
+                                    self.fire_modal_btn(o);
+                                }
+                            }
+                            if let Some(st) = self.state.as_ref() {
+                                st.request_redraw();
+                            }
+                            return;
+                        }
+                        let drop = self.state.as_ref().and_then(|st| {
+                            let rows = st.sidebar.rows(&st.tree);
+                            st.sidebar_drop(&rows)
+                        });
+                        let sidebar_drag =
+                            self.state.as_mut().and_then(|st| st.sidebar_drag.take());
+                        if sidebar_drag.is_some() {
+                            let st = self.state.as_mut().unwrap();
+                            st.apply_cursor();
+                            st.request_redraw();
+                        }
+                        if let Some(drag) = sidebar_drag {
+                            if drag.active {
+                                if let Some(drop) = drop {
+                                    self.reorder_selected(drop.placement);
+                                }
+                            } else if GROUP_TOGGLE_ENABLED
+                                && matches!(
+                                    self.state.as_ref().unwrap().tree.nodes[drag.pressed].kind,
+                                    Kind::Group
+                                )
+                            {
+                                let st = self.state.as_mut().unwrap();
+                                if drag.collapse_on_click {
+                                    st.sidebar.dispatch(
+                                        &mut st.tree,
+                                        sidebar::Action::SelectOnly(drag.pressed),
+                                    );
+                                }
+                                st.tree.nodes[drag.pressed].expanded =
+                                    !st.tree.nodes[drag.pressed].expanded;
+                                st.request_redraw();
+                            } else if drag.collapse_on_click {
+                                self.dispatch_sidebar(sidebar::Action::SelectOnly(drag.pressed));
+                            }
+                            return;
+                        }
                         if let Some(st) = self.state.as_mut() {
                             st.selecting = false;
                             st.sbar_drag = None;
@@ -3366,51 +3803,50 @@ impl ApplicationHandler<UserEvent> for App {
                         self.copy_to_clipboard();
                     }
                     (MouseButton::Right, ElementState::Pressed) => {
-                        let sel = self.state.as_ref().unwrap().selected;
-                        let rows = self.state.as_ref().unwrap().tree.rows(sel);
-                        let (pw, _) = self.state.as_ref().unwrap().logical_size();
+                        let rows = {
+                            let st = self.state.as_ref().unwrap();
+                            st.sidebar.rows(&st.tree)
+                        };
+                        let (pw, ph) = self.state.as_ref().unwrap().logical_size();
                         let sw = self.state.as_ref().unwrap().sidebar_w();
                         let inspector = self.state.as_ref().unwrap().inspector;
                         let tr = term_content_right(pw, inspector);
                         if let Some((node, _)) =
                             self.state.as_ref().unwrap().sidebar_hit(mx, my, &rows)
                         {
-                            // Sidebar: Start / Stop for the right-clicked node.
                             let st = self.state.as_mut().unwrap();
-                            st.selected = node;
+                            // Preserve a multi-selection only when the clicked
+                            // row belongs to it; the reducer owns that rule.
+                            st.sidebar
+                                .dispatch(&mut st.tree, sidebar::Action::ContextSelect(node));
                             st.focus = None;
+                            let items = sidebar_ctx_items();
+                            let enabled = items
+                                .iter()
+                                .map(|&a| sidebar_action_enabled(&st.tree, &st.sidebar, a, node))
+                                .collect();
                             st.ctx = Some(CtxMenu {
                                 x: (mx as usize).min(sw),
-                                y: my as usize,
+                                y: ctx_menu_y(my as usize, ph, items.len(), ctx_sep_count(&items)),
                                 node,
-                                items: vec![CtxAction::Start, CtxAction::Stop],
+                                items,
+                                enabled,
                                 target: None,
                             });
                             st.request_redraw();
                         } else if mx >= sw as f64 && (mx as usize) < tr && my >= HEADER_H as f64 {
-                            // Terminal area. A link under the pointer offers
-                            // "Open Link"; otherwise plain text offers a web
-                            // search of the selection (or word under the pointer).
                             let st = self.state.as_mut().unwrap();
-                            let node = st.selected;
-                            let (items, target) = if let Some((url, _)) = st.link_under_cursor() {
-                                (
-                                    vec![CtxAction::OpenLink, CtxAction::Copy, CtxAction::Paste],
-                                    Some(url),
-                                )
-                            } else {
-                                let q = st.search_target();
-                                let mut items = vec![CtxAction::Copy, CtxAction::Paste];
-                                if q.is_some() {
-                                    items.push(CtxAction::SearchGoogle);
-                                }
-                                (items, q)
-                            };
+                            // The terminal can show the first live descendant
+                            // when a group is selected; target the session that
+                            // was actually right-clicked, not the group row.
+                            let node = st.shown().unwrap_or(st.sidebar.primary());
+                            let (items, target) = st.term_ctx_items();
                             st.ctx = Some(CtxMenu {
                                 x: (mx as usize).min(pw.saturating_sub(CTX_W)),
-                                y: my as usize,
+                                y: ctx_menu_y(my as usize, ph, items.len(), ctx_sep_count(&items)),
                                 node,
                                 items,
+                                enabled: vec![true; terminal_ctx_actions().len()],
                                 target,
                             });
                             st.request_redraw();
@@ -3450,6 +3886,38 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                // A licensing modal captures all keyboard input until dismissed.
+                #[cfg(feature = "licensing")]
+                if self
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.modal, Some(Modal::EnterKey { .. })))
+                {
+                    let txt = event.text.as_ref().map(|s| s.to_string());
+                    self.modal_key_input(&event.logical_key, txt.as_deref());
+                    return;
+                }
+                if self.state.as_ref().is_some_and(|s| s.sidebar.is_renaming()) {
+                    let txt = event.text.as_ref().map(|s| s.to_string());
+                    if self.edit_sidebar_rename(&event.logical_key, txt.as_deref()) {
+                        return;
+                    }
+                }
+                #[cfg(feature = "licensing")]
+                if self.state.as_ref().is_some_and(|s| s.modal.is_some()) {
+                    // Nag is open: Enter/Escape dismiss it, everything else is
+                    // swallowed so keystrokes don't leak to the PTY behind it.
+                    if matches!(
+                        event.logical_key,
+                        Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)
+                    ) {
+                        if let Some(st) = self.state.as_mut() {
+                            st.modal = None;
+                            st.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 // While an inspector field is focused, the keyboard edits it
                 // instead of feeding the PTY.
                 if self
@@ -3464,7 +3932,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let kmods = self.state.as_ref().map(|s| s.mods).unwrap_or_default();
                 if let Some(sc) = match_shortcut(kmods, &event.logical_key) {
-                    let sel = self.state.as_ref().map(|s| s.selected);
+                    let sel = self.state.as_ref().map(|s| s.sidebar.primary());
                     match sc {
                         Shortcut::Copy => self.copy_to_clipboard(),
                         Shortcut::Paste => self.paste(),
@@ -3517,10 +3985,18 @@ impl ApplicationHandler<UserEvent> for App {
                 let bytes: Vec<u8> = match &event.logical_key {
                     Key::Named(NamedKey::Enter) => vec![b'\r'],
                     Key::Named(NamedKey::Backspace) => {
-                        if ctrl { b"\x17".to_vec() } else { vec![0x7f] }
+                        if ctrl {
+                            b"\x17".to_vec()
+                        } else {
+                            vec![0x7f]
+                        }
                     }
                     Key::Named(NamedKey::Tab) => {
-                        if shift { b"\x1b[Z".to_vec() } else { vec![b'\t'] }
+                        if shift {
+                            b"\x1b[Z".to_vec()
+                        } else {
+                            vec![b'\t']
+                        }
                     }
                     Key::Named(NamedKey::Escape) => vec![0x1b],
                     Key::Named(NamedKey::ArrowUp) => csi("A"),
@@ -3533,7 +4009,11 @@ impl ApplicationHandler<UserEvent> for App {
                     Key::Named(NamedKey::PageUp) => tilde(5),
                     Key::Named(NamedKey::PageDown) => tilde(6),
                     Key::Named(NamedKey::Space) => {
-                        if ctrl { vec![0] } else { vec![b' '] }
+                        if ctrl {
+                            vec![0]
+                        } else {
+                            vec![b' ']
+                        }
                     }
                     Key::Character(c) if ctrl => match c.chars().next() {
                         Some(ch) if ch.is_ascii() => {
@@ -3643,15 +4123,30 @@ mod tests {
             Some("/var/log/syslog".to_string())
         );
         // Tilde and relative forms.
-        assert_eq!(path_in("edit ~/notes.md today", "notes"), Some("~/notes.md".to_string()));
-        assert_eq!(path_in("run ./scripts/x.sh", "scripts"), Some("./scripts/x.sh".to_string()));
+        assert_eq!(
+            path_in("edit ~/notes.md today", "notes"),
+            Some("~/notes.md".to_string())
+        );
+        assert_eq!(
+            path_in("run ./scripts/x.sh", "scripts"),
+            Some("./scripts/x.sh".to_string())
+        );
         // Compiler output: `:` delimits, so the line:col tail stays off the
         // path — and hovering the numbers is not hovering a path.
-        assert_eq!(path_in(" --> src/ui.rs:100:5", "ui.rs"), Some("src/ui.rs".to_string()));
+        assert_eq!(
+            path_in(" --> src/ui.rs:100:5", "ui.rs"),
+            Some("src/ui.rs".to_string())
+        );
         assert_eq!(path_in(" --> src/ui.rs:100:5", "100"), None);
         // Wrapping brackets/quotes delimit; trailing sentence punctuation trims.
-        assert_eq!(path_in("see (src/lib.rs) there", "lib"), Some("src/lib.rs".to_string()));
-        assert_eq!(path_in("in /etc/hosts.", "hosts"), Some("/etc/hosts".to_string()));
+        assert_eq!(
+            path_in("see (src/lib.rs) there", "lib"),
+            Some("src/lib.rs".to_string())
+        );
+        assert_eq!(
+            path_in("in /etc/hosts.", "hosts"),
+            Some("/etc/hosts".to_string())
+        );
         // ...but hovering the trimmed punctuation itself is not a hit.
         assert_eq!(path_in("in /etc/hosts.", "."), None);
         // A slashless word is prose, not a path; so is whitespace.
@@ -3680,13 +4175,19 @@ mod tests {
             resolve_path(&abs.display().to_string(), None, &base),
             Some(abs.clone())
         );
-        assert_eq!(resolve_path("/definitely/not/here-42", Some(&base), &base), None);
+        assert_eq!(
+            resolve_path("/definitely/not/here-42", Some(&base), &base),
+            None
+        );
         // Relative resolves against the shell cwd — and dies without one.
         assert_eq!(
             resolve_path("sub/inner.txt", Some(&base), Path::new("/nowhere")),
             Some(sub.join("inner.txt"))
         );
-        assert_eq!(resolve_path("./file.txt", Some(&base), &base), Some(base.join("./file.txt")));
+        assert_eq!(
+            resolve_path("./file.txt", Some(&base), &base),
+            Some(base.join("./file.txt"))
+        );
         assert_eq!(resolve_path("sub/inner.txt", None, &base), None);
         // Tilde expands against home (here: the temp base), not cwd.
         assert_eq!(
@@ -3714,7 +4215,10 @@ mod tests {
         // An existing absolute path is a link, and the target is the path itself.
         assert_eq!(h.hover_text("/etc/hosts"), Some("/etc/hosts".into()));
         // URLs keep working, and win over path detection.
-        assert_eq!(h.hover_text("example.com"), Some("https://example.com/x".into()));
+        assert_eq!(
+            h.hover_text("example.com"),
+            Some("https://example.com/x".into())
+        );
         // Pathish prose that doesn't exist on disk is not a link; neither is
         // a tilde path that doesn't resolve.
         assert_eq!(h.hover_text("either/or"), None);
@@ -3725,7 +4229,10 @@ mod tests {
     fn urlencode_keeps_unreserved_and_escapes_the_rest() {
         assert_eq!(urlencode("hello world"), "hello%20world");
         assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
-        assert_eq!(urlencode("cargo build --release"), "cargo%20build%20--release");
+        assert_eq!(
+            urlencode("cargo build --release"),
+            "cargo%20build%20--release"
+        );
         assert_eq!(urlencode("a+b&c=d"), "a%2Bb%26c%3Dd");
     }
 
@@ -3802,6 +4309,132 @@ groups:
     }
 
     #[test]
+    fn grouping_and_ungrouping_replace_nodes_in_place() {
+        let mut t = parse_workspace(
+            "items:\n  - name: one\n    dir: /one\n  - name: two\n    dir: /two\n  - name: Existing\n    sessions:\n      - name: nested\n        dir: /nested\n  - name: three\n    dir: /three\n",
+            Path::new("/home/u"),
+        );
+        let before: Vec<_> = t.nodes[t.root]
+            .children
+            .iter()
+            .map(|&id| t.nodes[id].name.clone())
+            .collect();
+        assert_eq!(before, ["one", "two", "Existing", "three"]);
+        let one = t.nodes[t.root].children[0];
+        let two = t.nodes[t.root].children[1];
+        let gid = t.group_leaves(&[one, two], "New".into()).unwrap();
+        let grouped: Vec<_> = t.nodes[t.root]
+            .children
+            .iter()
+            .map(|&id| t.nodes[id].name.clone())
+            .collect();
+        assert_eq!(grouped, ["New", "Existing", "three"]);
+        assert_eq!(t.nodes[gid].children, [one, two]);
+        let lifted = t.ungroup(&[gid]).unwrap();
+        assert_eq!(lifted, [one, two]);
+        let after: Vec<_> = t.nodes[t.root]
+            .children
+            .iter()
+            .map(|&id| t.nodes[id].name.clone())
+            .collect();
+        assert_eq!(after, before);
+        assert_eq!(
+            t.nodes
+                .iter()
+                .filter(|n| matches!(n.kind, Kind::Group) && n.parent == Some(t.root))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn group_names_may_be_edited_all_the_way_to_empty() {
+        let mut t = tree();
+        let id = group(&t, "Music");
+        t.set_name(id, String::new());
+        assert!(t.nodes[id].name.is_empty());
+    }
+
+    #[test]
+    fn grouping_existing_group_children_is_supported() {
+        let mut t = tree();
+        let music = group(&t, "Music");
+        let selected = t.leaves(music);
+        let gid = t.group_leaves(&selected, "Replacement".into()).unwrap();
+        assert_eq!(t.nodes[gid].children, selected);
+        assert!(
+            t.nodes[music].parent.is_none(),
+            "emptied source group is pruned"
+        );
+    }
+
+    #[test]
+    fn sidebar_has_exactly_one_spacer_between_group_blocks() {
+        let rows = vec![
+            Row {
+                id: 1,
+                name: "one".into(),
+                is_group: false,
+            },
+            Row {
+                id: 2,
+                name: "two".into(),
+                is_group: false,
+            },
+            Row {
+                id: 3,
+                name: "Group".into(),
+                is_group: true,
+            },
+            Row {
+                id: 4,
+                name: "nested".into(),
+                is_group: false,
+            },
+            Row {
+                id: 5,
+                name: "three".into(),
+                is_group: false,
+            },
+        ];
+        assert_eq!(sidebar_row_tops(&rows, 16), [0, 16, 48, 64, 80]);
+        assert_eq!(
+            sidebar_drop_placement(&rows, 16, 40),
+            Placement::Before(3),
+            "the spacer is a boundary before the next group"
+        );
+        assert_eq!(sidebar_drop_placement(&rows, 16, 48), Placement::Before(3));
+        assert_eq!(sidebar_drop_placement(&rows, 16, 56), Placement::Into(3));
+        assert_eq!(sidebar_drop_placement(&rows, 16, 63), Placement::After(3));
+    }
+
+    #[test]
+    fn sidebar_drag_draws_an_active_insertion_marker() {
+        let mut renderer = Renderer::new();
+        let rh = renderer.cell_h;
+        let rows = vec![Row {
+            id: 1,
+            name: "one".into(),
+            is_group: false,
+        }];
+        let mut buf = vec![0; 100 * 80];
+        let selection = HashSet::from([1]);
+        let view = SidebarView {
+            rows: &rows,
+            primary: 1,
+            selection: &selection,
+            renaming: None,
+            hovered: None,
+            drop: Some(sidebar::DropPreview {
+                placement: Placement::After(1),
+            }),
+        };
+        draw_sidebar(&mut buf, 100, 80, &mut renderer, &view, 70, 0);
+        let marker_y = HEADER_H + rh - 1;
+        assert_eq!(buf[marker_y * 100 + 2], LINK);
+    }
+
+    #[test]
     fn resolve_workdir_handles_relative_and_absolute() {
         let base = Path::new("/home/u/projects/app");
         // A relative dir (the `../filex` shortcut) resolves against the layout
@@ -3816,9 +4449,67 @@ groups:
             Path::new("/home/u/projects/app/sub"),
         );
         // Absolute and ~-expanded dirs are left untouched.
+        assert_eq!(resolve_workdir(base, Path::new("/etc")), Path::new("/etc"),);
+    }
+
+    #[test]
+    fn new_tab_prefers_the_selected_tabs_live_cwd() {
+        let t = tree();
+        let leaf = t.leaves(group(&t, "Music"))[0];
         assert_eq!(
-            resolve_workdir(base, Path::new("/etc")),
-            Path::new("/etc"),
+            new_tab_workdir(
+                &t,
+                leaf,
+                Some(PathBuf::from("/tmp/after-cd")),
+                Path::new("/home/u"),
+            ),
+            Path::new("/tmp/after-cd"),
+        );
+
+        let configured = t.leaf_spec(leaf).unwrap().0;
+        assert_eq!(
+            new_tab_workdir(&t, leaf, None, Path::new("/home/u")),
+            configured,
+        );
+    }
+
+    #[test]
+    fn terminal_context_menu_has_requested_order_and_separator() {
+        let items = terminal_ctx_actions();
+        assert_eq!(
+            items.iter().map(|item| item.label()).collect::<Vec<_>>(),
+            ["Copy", "Paste", "Search Google", "Paste + Submit", "Submit"],
+        );
+        let menu = CtxMenu {
+            x: 0,
+            y: 0,
+            node: 0,
+            items,
+            enabled: vec![true; 5],
+            target: None,
+        };
+        assert_eq!(menu.seps(), [2]);
+        let gap_y = 1 + 3 * ROW_H + CTX_SEP_H / 2;
+        assert_eq!(ctx_item_at(&menu, 20.0, gap_y as f64), None);
+        assert_eq!(
+            ctx_item_at(&menu, 20.0, (1 + 3 * ROW_H + CTX_SEP_H) as f64),
+            Some(3),
+        );
+    }
+
+    #[test]
+    fn scrollbar_gutter_owns_the_full_right_edge() {
+        let (w, h) = (1000, 700);
+        let (x, y, gutter_w, gutter_h) = scrollbar_gutter_rect(w, h, false);
+        assert_eq!(x + gutter_w, w);
+        assert_eq!(y + gutter_h, h);
+
+        // Neither the narrow east grip nor the enlarged bottom-right corner
+        // may steal any part of the fullscreen scrollbar gutter.
+        assert_eq!(resize_dir(w, h, false, (w - 1) as f64, 200.0), None);
+        assert_eq!(
+            resize_dir(w, h, false, (w - 1) as f64, (h - 1) as f64),
+            None,
         );
     }
 
@@ -3860,15 +4551,23 @@ groups:
 
     #[test]
     fn closing_selects_preceding_sibling_then_parent() {
-        let t = tree();
+        let mut t = tree();
         let music = group(&t, "Music");
-        let [a, b] = t.leaves(music)[..] else { panic!() };
+        let [a, b] = t.leaves(music)[..] else {
+            panic!()
+        };
         // Closing the 2nd session lands on the 1st (the preceding one)...
         assert_eq!(t.prev_sibling(b), Some(a));
         // ...and closing the 1st has no preceding sibling, so the caller
         // falls back to the parent group.
         assert_eq!(t.prev_sibling(a), None);
         assert_eq!(t.prev_sibling(a).unwrap_or(music), music);
+
+        // Natural shell exit unlinks configured leaves too; `dynamic` only
+        // governs explicit close behavior, not Ctrl+D.
+        assert!(!t.nodes[b].dynamic);
+        assert_eq!(t.unlink(b), Some(a));
+        assert!(!t.nodes[music].children.contains(&b));
     }
 
     #[test]
@@ -3881,7 +4580,13 @@ groups:
         assert!(!already_running(&idle, "hermes")); // no foreground job
         assert!(!already_running(&busy, "")); // a bare shell is never "running"
         assert!(already_running(&busy, "hermes")); // program matches
-        assert!(already_running(&Obs { foreground: true, cmd: Some("bun run main.ts".into()) }, "bun run main.ts"));
+        assert!(already_running(
+            &Obs {
+                foreground: true,
+                cmd: Some("bun run main.ts".into())
+            },
+            "bun run main.ts"
+        ));
         assert!(!already_running(&busy, "./run.sh")); // different program
     }
 
@@ -3889,7 +4594,9 @@ groups:
     fn plan_start_is_idempotent() {
         let t = tree();
         let music = group(&t, "Music");
-        let [a, b] = t.leaves(music)[..] else { panic!() };
+        let [a, b] = t.leaves(music)[..] else {
+            panic!()
+        };
 
         // Nothing spawned yet: each leaf gets Spawn then Run.
         let none = |_: NodeId| false;
@@ -3902,7 +4609,13 @@ groups:
         // entirely, only `b` is (re)run.
         let all = |_: NodeId| true;
         let mut obs = HashMap::new();
-        obs.insert(a, Obs { foreground: true, cmd: Some("hermes".into()) });
+        obs.insert(
+            a,
+            Obs {
+                foreground: true,
+                cmd: Some("hermes".into()),
+            },
+        );
         let acts = plan_start(&t, &all, &obs, music);
         assert_eq!(acts.len(), 1);
         assert!(matches!(acts[0], Action::Run(x) if x == b));
@@ -3912,7 +4625,9 @@ groups:
     fn plan_stop_targets_only_live_leaves() {
         let t = tree();
         let music = group(&t, "Music");
-        let [a, _b] = t.leaves(music)[..] else { panic!() };
+        let [a, _b] = t.leaves(music)[..] else {
+            panic!()
+        };
         let only_a = move |n: NodeId| n == a;
         let acts = plan_stop(&t, &only_a, music);
         assert_eq!(acts.len(), 1);
@@ -3945,8 +4660,14 @@ groups:
         let t = tree();
         let music = group(&t, "Music");
         let leaf = t.leaves(music)[0];
-        assert_eq!(t.field_text(leaf, Field::Title).as_deref(), Some("Hermes chat"));
-        assert_eq!(t.field_text(leaf, Field::Command).as_deref(), Some("hermes"));
+        assert_eq!(
+            t.field_text(leaf, Field::Title).as_deref(),
+            Some("Hermes chat")
+        );
+        assert_eq!(
+            t.field_text(leaf, Field::Command).as_deref(),
+            Some("hermes")
+        );
         assert_eq!(
             t.field_text(leaf, Field::Dir).as_deref(),
             Some("/home/u/Music")
@@ -3991,7 +4712,10 @@ groups:
         // The primary face is baked into the binary, so this must succeed on a
         // bare machine with no fontconfig and no system fonts — the macOS fix.
         let mut r = Renderer::new();
-        assert!(r.cell_w >= 1 && r.cell_h >= 1, "cell metrics must be positive");
+        assert!(
+            r.cell_w >= 1 && r.cell_h >= 1,
+            "cell metrics must be positive"
+        );
         let g = r.glyph('M', FontStyle::Regular, FONT_PX);
         assert!(g.w > 0 && g.h > 0, "a basic glyph must rasterize");
         // Bold and italic faces are distinct from regular (real attribute
@@ -4032,7 +4756,10 @@ groups:
             assert_eq!(match_shortcut(ctrl_shift, &s), None);
             assert_eq!(match_shortcut(ctrl_shift, &q), Some(Shortcut::Quit));
             // Both `,` and its shifted `<` edit the layout.
-            assert_eq!(match_shortcut(ctrl_shift, &comma), Some(Shortcut::EditLayout));
+            assert_eq!(
+                match_shortcut(ctrl_shift, &comma),
+                Some(Shortcut::EditLayout)
+            );
             assert_eq!(match_shortcut(ctrl_shift, &lt), Some(Shortcut::EditLayout));
             assert_eq!(match_shortcut(cmd, &c), None);
         }

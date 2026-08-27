@@ -72,8 +72,32 @@ fn ui_walkthrough() {
     h.screenshot("win-hover");
 
     // 6. Sidebar toggled off (⌘B / Ctrl+Shift+B): terminal takes the full width.
-    h.hover_win(None).select("Diabetes/Sugar tracker").sidebar(false);
+    h.hover_win(None)
+        .select("Diabetes/Sugar tracker")
+        .sidebar(false);
     h.screenshot("sidebar-hidden");
+}
+
+/// The two context menus. Open the printed PNGs and check the item lists and
+/// the group dividers against the intended shape:
+///
+/// * tab (sidebar): Start / Stop / Close, no dividers.
+/// * terminal content: Copy / Paste / Paste + Enter | Search Google | Submit.
+#[test]
+fn context_menus() {
+    let mut h = Harness::new(WORKSPACE);
+    eprintln!("screenshot dir: {}", h.dir().display());
+    h.select("Diabetes/Sugar tracker")
+        .feed("Sugar tracker", SAMPLE);
+
+    // Right-click a tab in the sidebar.
+    h.mouse_at(90.0, 150.0).ctx_sidebar();
+    h.screenshot("ctx-tab");
+
+    // Right-click terminal content, pointer over a word so the search entry
+    // (and therefore its dividers) is present.
+    h.mouse_at(430.0, 120.0).ctx_terminal();
+    h.screenshot("ctx-terminal");
 }
 
 /// The frame a Mac actually *presents*: the physical compose, i.e. the
@@ -126,4 +150,36 @@ fn retina_parity() {
         da, db,
         "logical frame must be identical at 1x and 2x (macOS parity)"
     );
+}
+
+/// The licensing modals (feature-gated): the unregistered nag and the
+/// key-entry dialog, empty and in its error state. Open the printed PNGs to
+/// review the Win2k dialog chrome.
+#[cfg(feature = "licensing")]
+#[test]
+fn licensing_modals() {
+    let mut h = Harness::new(WORKSPACE);
+    eprintln!("screenshot dir: {}", h.dir().display());
+
+    h.select("Diabetes/Sugar tracker")
+        .feed("Sugar tracker", SAMPLE);
+    h.nag();
+    h.screenshot("license-nag");
+
+    // Hover feedback: the pointer over "Buy License" lifts that button.
+    h.mouse_at(422.0, 405.0);
+    h.screenshot("license-nag-hover");
+
+    // Press feedback: "Continue" held down (sunken) with the pointer over it.
+    h.mouse_at(678.0, 405.0).press_modal_btn(2);
+    h.screenshot("license-nag-press");
+
+    h.enter_key(
+        "TS-DEMO-KEY-eyJuYW1lIjoiQWRhIiwicHJvZHVjdCI6InRlcm1zZXQifQ",
+        false,
+    );
+    h.screenshot("license-enter-key");
+
+    h.enter_key("this-is-not-a-valid-key", true);
+    h.screenshot("license-enter-key-error");
 }

@@ -10,12 +10,15 @@
 // the path falls through to the SPA fallback and returns HTML.
 
 import { AuthService, ItemService, TestService } from "../proto/index.ts";
+import { billingRoutes } from "./billing.ts";
 import { connectRoutes } from "./connect.ts";
 import { authServiceImpl } from "./services/auth.ts";
 import { itemServiceImpl } from "./services/item.ts";
 import { testServiceImpl } from "./services/test.ts";
 
 export const apiRoutes = {
+  // Plain HTTP billing routes (Stripe checkout + webhook + license lookup).
+  ...billingRoutes,
   ...connectRoutes([
     [AuthService, authServiceImpl],
     [ItemService, itemServiceImpl],

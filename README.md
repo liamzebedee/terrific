@@ -50,6 +50,14 @@ groups:
         command: redis-server
 ```
 
+The sidebar works like a compact layers panel: click a terminal, Shift-click
+another to select a visible range, then right-click and choose **Group** or
+**Ungroup**. Choose **Rename group** to edit a group name inline. These changes
+are saved to the open YAML file immediately. Once edited, the file uses one
+ordered top-level `items:` list so groups and ungrouped terminals retain their
+exact sidebar order across launches. Drag sidebar rows to reorder them or move
+a terminal into another group.
+
 ## tmux backend
 
 Add `tmux: true` at the top of your layout file and every tab is backed by a
@@ -103,4 +111,3 @@ Special key is assumed as macOS (Cmd), Linux (Ctrl+Shift)
  - **Toggle sidebar**. Ctrl+Shift+B
  - **Edit layout**. Ctrl+Shift+, (opens the YAML in nano)
  - **Quit**. Ctrl+Shift+Q
-

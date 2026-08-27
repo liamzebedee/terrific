@@ -3,8 +3,15 @@ name = "termset-cli"
 version = "0.1.0"
 edition = "2024"
 
-# The CLI binary is `mtm`; the library crate stays `termem_demo` (the test
-# harness in `testkit` drives it headlessly).
+[features]
+# The paid-license model: offline license verification plus the unregistered
+# "buy a license" nag. On by default; `--no-default-features` compiles the whole
+# thing out and ships an unrestricted binary (the "turn the model off" switch).
+default = ["licensing"]
+licensing = []
+
+# The CLI binary is `terms`; the library crate is `termset_cli` (the test
+# harness in `testkit` drives termset headlessly).
 [[bin]]
 name = "terms"
 path = "src/main.rs"
@@ -26,3 +33,6 @@ winit = "0.30"
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"
 x11rb = "0.13"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

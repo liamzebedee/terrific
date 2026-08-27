@@ -115,10 +115,16 @@ impl Parser {
         }
         if let Some(block) = &mut self.block {
             if line.starts_with(b"%end") {
-                return Some(Line::Reply { lines: self.block.take().unwrap(), error: false });
+                return Some(Line::Reply {
+                    lines: self.block.take().unwrap(),
+                    error: false,
+                });
             }
             if line.starts_with(b"%error") {
-                return Some(Line::Reply { lines: self.block.take().unwrap(), error: true });
+                return Some(Line::Reply {
+                    lines: self.block.take().unwrap(),
+                    error: true,
+                });
             }
             block.push(line.to_vec());
             return None;
@@ -157,7 +163,10 @@ impl Parser {
 /// and leave the final line unterminated so the cursor lands right after the
 /// prompt — the same place it is in the live pane.
 fn join_capture(lines: &[Vec<u8>]) -> Vec<u8> {
-    let end = lines.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1);
+    let end = lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map_or(0, |i| i + 1);
     let mut out = Vec::new();
     for (i, line) in lines[..end].iter().enumerate() {
         if i > 0 {
@@ -384,12 +393,16 @@ where
     }
     // The client never renders (control mode), but tmux still wants a TERM.
     c.env("TERM", "xterm-256color");
-    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    c.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let mut child = c.spawn()?;
 
     let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
     let stdout = child.stdout.take().expect("piped stdout");
-    let client = Client { stdin: stdin.clone() };
+    let client = Client {
+        stdin: stdin.clone(),
+    };
 
     client.resize(cfg.cols, cfg.lines);
     client.cmd("display-message -p -F 'TSINFO #{pane_pid}'");
@@ -486,7 +499,13 @@ mod tests {
         // module history): attach ack, notifications, output, a reply, exit.
         let mut p = Parser::default();
         assert_eq!(p.feed_line(b"%begin 1783494396 265 0\n"), None);
-        assert_eq!(p.feed_line(b"%end 1783494396 265 0\n"), Some(Line::Reply { lines: vec![], error: false }));
+        assert_eq!(
+            p.feed_line(b"%end 1783494396 265 0\n"),
+            Some(Line::Reply {
+                lines: vec![],
+                error: false
+            })
+        );
         assert_eq!(p.feed_line(b"%window-add @0\n"), None);
         assert_eq!(p.feed_line(b"%session-changed $0 web\n"), None);
         assert_eq!(
@@ -497,7 +516,10 @@ mod tests {
         assert_eq!(p.feed_line(b"TSINFO 4242\n"), None);
         assert_eq!(
             p.feed_line(b"%end 1783494396 271 1\n"),
-            Some(Line::Reply { lines: vec![b"TSINFO 4242".to_vec()], error: false })
+            Some(Line::Reply {
+                lines: vec![b"TSINFO 4242".to_vec()],
+                error: false
+            })
         );
         assert_eq!(parse_tsinfo(b"TSINFO 4242"), Some(4242));
         // %-lines inside a block are content, not notifications.
@@ -505,14 +527,23 @@ mod tests {
         assert_eq!(p.feed_line(b"%output not a notification\n"), None);
         assert_eq!(
             p.feed_line(b"%error 1 300 1\n"),
-            Some(Line::Reply { lines: vec![b"%output not a notification".to_vec()], error: true })
+            Some(Line::Reply {
+                lines: vec![b"%output not a notification".to_vec()],
+                error: true
+            })
         );
         assert_eq!(p.feed_line(b"%exit\n"), Some(Line::Exit));
     }
 
     #[test]
     fn capture_join_trims_the_blank_tail() {
-        let lines = vec![b"one".to_vec(), b"".to_vec(), b"three".to_vec(), b"".to_vec(), b"".to_vec()];
+        let lines = vec![
+            b"one".to_vec(),
+            b"".to_vec(),
+            b"three".to_vec(),
+            b"".to_vec(),
+            b"".to_vec(),
+        ];
         assert_eq!(join_capture(&lines), b"one\r\n\r\nthree");
     }
 
@@ -525,8 +556,15 @@ mod tests {
     }
 
     fn test_term() -> Arc<FairMutex<Term<NullListener>>> {
-        let size = crate::TermSize { cols: 80, lines: 24 };
-        Arc::new(FairMutex::new(Term::new(Config::default(), &size, NullListener)))
+        let size = crate::TermSize {
+            cols: 80,
+            lines: 24,
+        };
+        Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &size,
+            NullListener,
+        )))
     }
 
     fn grid_text(term: &Arc<FairMutex<Term<NullListener>>>) -> String {
@@ -554,7 +592,9 @@ mod tests {
     }
 
     fn kill_server(sock: &str) {
-        let _ = Command::new("tmux").args(["-L", sock, "kill-server"]).status();
+        let _ = Command::new("tmux")
+            .args(["-L", sock, "kill-server"])
+            .status();
     }
 
     #[test]
@@ -594,15 +634,32 @@ mod tests {
         };
         assert!(pid > 0, "pane pid must be a real process");
         client.send_bytes(b"echo TMUX_R0UNDTRIP\r");
-        assert!(wait_for(&term, "TMUX_R0UNDTRIP"), "typed output must reach the local grid");
+        assert!(
+            wait_for(&term, "TMUX_R0UNDTRIP"),
+            "typed output must reach the local grid"
+        );
 
         // Adoption: content printed while detached must backfill on attach.
         let run = |args: &[&str]| {
             assert!(
-                Command::new("tmux").args(["-L", &sock]).args(args).status().unwrap().success()
+                Command::new("tmux")
+                    .args(["-L", &sock])
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
             );
         };
-        run(&["new-session", "-d", "-s", "it-adopt", "-x", "80", "-y", "24"]);
+        run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "it-adopt",
+            "-x",
+            "80",
+            "-y",
+            "24",
+        ]);
         run(&["send-keys", "-t", "it-adopt", "echo ADOPTED_L1NE", "Enter"]);
         std::thread::sleep(Duration::from_millis(500));
         let term2 = test_term();

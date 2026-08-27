@@ -51,6 +51,13 @@ Rules:
 - `src/ui.rs` — rendering and chrome: palette, embedded backdrop, framebuffer
   drawing primitives, Win2k-style widgets (sidebar, inspector, context menu),
   and chrome geometry / hit-testing.
+- `src/license.rs` — the paid-license model (behind the `licensing` cargo
+  feature, on by default): offline Ed25519 verification of a pasted key against
+  the compiled-in public key (`scripts/license-pubkey.bin`), the on-disk license
+  + launch-counter storage under `~/.config/termset/`, and the unregistered-nag
+  bookkeeping. The nag/menu/dialog UI lives in `lib.rs` (`Modal`) and `ui.rs`
+  (`draw_nag`/`draw_enterkey`). `--no-default-features` compiles the whole model
+  out. Keys are minted by the backend — see `docs/SELLING.md` and `web/`.
 - `src/main.rs` — thin binary shim that calls into the library.
 - `src/testkit.rs` — headless screenshot harness; builds the real `State` with no
   window and paints into an off-screen framebuffer. `screenshot()` captures the

@@ -12,7 +12,8 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use winit::window::{CursorIcon, ResizeDirection};
 
 use crate::{
-    CtxMenu, FONT_PX, Field, FontStyle, Listener, NodeId, Renderer, Row, TextCmd, Tree, font_style,
+    CtxMenu, FONT_PX, Field, FontStyle, Listener, NodeId, Placement, Renderer, Row, TextCmd, Tree,
+    font_style, sidebar::DropPreview,
 };
 
 // Dark theme: white text over the teal/green backdrop image, black chrome.
@@ -42,6 +43,7 @@ pub(crate) const SIDEBAR_MIN_CHARS: usize = 5; // floor on the label area, in ch
 pub(crate) const HEADER_H: usize = 16; // title bar; one content row tall (= cell_h at FONT_PX) for uniform heights
 pub(crate) const ROW_H: usize = 20; // context-menu item height
 pub(crate) const CTX_W: usize = 150; // context-menu width (fits "Search Google")
+pub(crate) const CTX_SEP_H: usize = 9;
 pub(crate) const RPANEL_W: usize = 252; // right inspector pane width
 pub(crate) const TLIGHT_CELL: usize = 18; // per-dot hit cell for the window controls
 pub(crate) const TLIGHT_R: f32 = 5.0; // traffic-light dot radius (px); diameter 10 in a 16px row
@@ -67,6 +69,8 @@ pub(crate) const PANEL_HI: u32 = 0x33_33_33; // top of a raised gradient (select
 pub(crate) const PANEL_LO: u32 = 0x1f_1f_1f; // bottom of a raised gradient
 pub(crate) const HEAD_HI: u32 = 0x16_16_16; // header gradient top
 pub(crate) const HEAD_LO: u32 = 0x08_08_08; // header gradient bottom
+pub(crate) const BTN_HOVER_HI: u32 = 0x4a_4a_4a; // raised button gradient, hovered
+pub(crate) const BTN_HOVER_LO: u32 = 0x2e_2e_2e;
 pub(crate) const BEVEL_LT: u32 = 0x3a_3a_3a; // raised highlight (top/left)
 pub(crate) const BEVEL_DK: u32 = 0x00_00_00; // raised shadow (bottom/right)
 pub(crate) const INK: u32 = 0xf0_f0_f0; // primary chrome text (white)
@@ -99,7 +103,11 @@ pub(crate) fn osc_color(index: usize) -> Rgb {
         258 => FG, // NamedColor::Cursor (drawn in the default ink)
         _ => FG,
     };
-    Rgb { r: (packed >> 16) as u8, g: (packed >> 8) as u8, b: packed as u8 }
+    Rgb {
+        r: (packed >> 16) as u8,
+        g: (packed >> 8) as u8,
+        b: packed as u8,
+    }
 }
 
 // ANSI palette tuned for the **dark** backdrop: bright, saturated hues that pop
@@ -191,23 +199,21 @@ pub(crate) struct Backdrop {
 /// terminal background) rather than panicking.
 pub(crate) fn backdrop() -> &'static Backdrop {
     static BACKDROP: std::sync::OnceLock<Backdrop> = std::sync::OnceLock::new();
-    BACKDROP.get_or_init(|| {
-        match image::load_from_memory(BACKDROP_PNG) {
-            Ok(img) => {
-                let rgb = img.to_rgb8();
-                let (w, h) = (rgb.width() as usize, rgb.height() as usize);
-                let px = rgb
-                    .pixels()
-                    .map(|p| darken(pack(p[0], p[1], p[2]), BACKDROP_DIM))
-                    .collect();
-                Backdrop { w, h, px }
-            }
-            Err(_) => Backdrop {
-                w: 1,
-                h: 1,
-                px: vec![darken(BG, BACKDROP_DIM)],
-            },
+    BACKDROP.get_or_init(|| match image::load_from_memory(BACKDROP_PNG) {
+        Ok(img) => {
+            let rgb = img.to_rgb8();
+            let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+            let px = rgb
+                .pixels()
+                .map(|p| darken(pack(p[0], p[1], p[2]), BACKDROP_DIM))
+                .collect();
+            Backdrop { w, h, px }
         }
+        Err(_) => Backdrop {
+            w: 1,
+            h: 1,
+            px: vec![darken(BG, BACKDROP_DIM)],
+        },
     })
 }
 
@@ -226,7 +232,15 @@ pub(crate) fn darken(color: u32, k: u32) -> u32 {
 /// compose and the crisp Retina overdraw) so the image shows under every cell
 /// that doesn't set its own background. Stretching a smooth gradient is
 /// visually lossless, so no aspect-correct cropping is needed.
-pub(crate) fn fill_backdrop(buf: &mut [u32], bw: usize, bh: usize, x: usize, y: usize, w: usize, h: usize) {
+pub(crate) fn fill_backdrop(
+    buf: &mut [u32],
+    bw: usize,
+    bh: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) {
     let img = backdrop();
     if w == 0 || h == 0 || img.w == 0 || img.h == 0 {
         return;
@@ -252,7 +266,16 @@ pub(crate) fn fill_backdrop(buf: &mut [u32], bw: usize, bh: usize, x: usize, y: 
 
 // --- drawing helpers (unchanged) -------------------------------------------
 
-pub(crate) fn fill_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
+pub(crate) fn fill_rect(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+) {
     for yy in y..(y + h).min(ph) {
         for xx in x..(x + w).min(pw) {
             buf[yy * pw + xx] = color;
@@ -261,13 +284,27 @@ pub(crate) fn fill_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usiz
 }
 
 /// Vertical gradient fill: row `y` lerps from `top` to `bot`.
-pub(crate) fn vgradient(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize, h: usize, top: u32, bot: u32) {
+pub(crate) fn vgradient(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    top: u32,
+    bot: u32,
+) {
     for row in 0..h {
         let yy = y + row;
         if yy >= ph {
             break;
         }
-        let t = if h > 1 { (row * 255 / (h - 1)) as u32 } else { 0 };
+        let t = if h > 1 {
+            (row * 255 / (h - 1)) as u32
+        } else {
+            0
+        };
         let color = blend(bot, top, t);
         for col in 0..w {
             let xx = x + col;
@@ -282,7 +319,15 @@ pub(crate) fn vgradient(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usiz
 /// A filled, anti-aliased disc centred at (`cx`,`cy`) with radius `r`, blended
 /// over whatever is already in `buf`. A 1px-soft edge keeps the small chrome
 /// dots from looking jagged at logical resolution.
-pub(crate) fn fill_circle(buf: &mut [u32], pw: usize, ph: usize, cx: f32, cy: f32, r: f32, color: u32) {
+pub(crate) fn fill_circle(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    color: u32,
+) {
     let x0 = (cx - r - 1.0).floor().max(0.0) as usize;
     let y0 = (cy - r - 1.0).floor().max(0.0) as usize;
     let x1 = ((cx + r + 1.0).ceil().max(0.0) as usize).min(pw);
@@ -327,7 +372,15 @@ pub(crate) fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> 
 /// Stamp the dark macOS-style glyph inside a traffic-light dot centred at
 /// (`cx`,`cy`) with radius `r`. Strokes are anti-aliased line segments blended
 /// over the dot, so the symbol reads as an inset cut-out.
-pub(crate) fn draw_tlight_glyph(buf: &mut [u32], pw: usize, ph: usize, cx: f32, cy: f32, r: f32, g: TlGlyph) {
+pub(crate) fn draw_tlight_glyph(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    g: TlGlyph,
+) {
     let e = r * 0.5; // arm half-length
     let segs: &[(f32, f32, f32, f32)] = match g {
         TlGlyph::Minus => &[(-1.0, 0.0, 1.0, 0.0)],
@@ -360,7 +413,16 @@ pub(crate) fn draw_tlight_glyph(buf: &mut [u32], pw: usize, ph: usize, cx: f32, 
 }
 
 /// 1px rectangle outline.
-pub(crate) fn stroke_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
+pub(crate) fn stroke_rect(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+) {
     if w == 0 || h == 0 {
         return;
     }
@@ -431,7 +493,15 @@ pub(crate) fn draw_text(
 /// logical command is re-laid at `(sx, sy)` with glyphs rasterized at
 /// `FONT_PX × sy`, so chrome text comes out as crisp as the terminal grid on a
 /// Retina display (rather than being nearest-neighbour-doubled and chunky).
-pub(crate) fn render_text_cmds(buf: &mut [u32], bw: usize, bh: usize, r: &mut Renderer, cmds: Vec<TextCmd>, sx: f64, sy: f64) {
+pub(crate) fn render_text_cmds(
+    buf: &mut [u32],
+    bw: usize,
+    bh: usize,
+    r: &mut Renderer,
+    cmds: Vec<TextCmd>,
+    sx: f64,
+    sy: f64,
+) {
     let font_px = FONT_PX * sy as f32;
     let cell_w = ((r.cell_w as f64 * sx).round() as usize).max(1);
     for cmd in cmds {
@@ -523,10 +593,18 @@ fn block_cell(c: char, w: usize, h: usize) -> Option<(Vec<(usize, usize, usize, 
             let mask = QUAD[c as usize - 0x2596];
             let (mx, my) = (ex(1, 2), ey(1, 2));
             let mut v = Vec::new();
-            if mask & 1 != 0 { v.push((0, 0, mx, my)); }
-            if mask & 2 != 0 { v.push((mx, 0, w, my)); }
-            if mask & 4 != 0 { v.push((0, my, mx, h)); }
-            if mask & 8 != 0 { v.push((mx, my, w, h)); }
+            if mask & 1 != 0 {
+                v.push((0, 0, mx, my));
+            }
+            if mask & 2 != 0 {
+                v.push((mx, 0, w, my));
+            }
+            if mask & 4 != 0 {
+                v.push((0, my, mx, h));
+            }
+            if mask & 8 != 0 {
+                v.push((mx, my, w, h));
+            }
             v
         }
         // Sextants (1FB00..1FB3B): 2 cols × 3 rows. The code points enumerate the
@@ -535,12 +613,23 @@ fn block_cell(c: char, w: usize, h: usize) -> Option<(Vec<(usize, usize, usize, 
         // 4 BL, 5 BR (verified against the Unicode BLOCK SEXTANT-nnn names).
         '\u{1FB00}'..='\u{1FB3B}' => {
             let mut val = (c as u32 - 0x1FB00) + 1;
-            if val >= 21 { val += 1; }
-            if val >= 42 { val += 1; }
+            if val >= 21 {
+                val += 1;
+            }
+            if val >= 42 {
+                val += 1;
+            }
             let cols = [(0, ex(1, 2)), (ex(1, 2), w)];
             let rows = [(0, ey(1, 3)), (ey(1, 3), ey(2, 3)), (ey(2, 3), h)];
             let mut v = Vec::new();
-            for (bit, rr, cc) in [(0, 0, 0), (1, 0, 1), (2, 1, 0), (3, 1, 1), (4, 2, 0), (5, 2, 1)] {
+            for (bit, rr, cc) in [
+                (0, 0, 0),
+                (1, 0, 1),
+                (2, 1, 0),
+                (3, 1, 1),
+                (4, 2, 0),
+                (5, 2, 1),
+            ] {
                 if val & (1 << bit) != 0 {
                     let (x0, x1) = cols[cc];
                     let (y0, y1) = rows[rr];
@@ -612,7 +701,16 @@ pub(crate) fn draw_terminal_cells(
             bg = SEL;
         }
         if bg != BG {
-            fill_rect(buf, bw, bh, x0, y0, span.min(clip_right.saturating_sub(x0)), cell_h, bg);
+            fill_rect(
+                buf,
+                bw,
+                bh,
+                x0,
+                y0,
+                span.min(clip_right.saturating_sub(x0)),
+                cell_h,
+                bg,
+            );
         }
 
         let c = cell.c;
@@ -628,7 +726,11 @@ pub(crate) fn draw_terminal_cells(
                 for py in (y0 + ry0)..bottom {
                     for px in left..right {
                         let idx = py * bw + px;
-                        buf[idx] = if cov == 255 { fg } else { blend(fg, buf[idx], cov) };
+                        buf[idx] = if cov == 255 {
+                            fg
+                        } else {
+                            blend(fg, buf[idx], cov)
+                        };
                     }
                 }
             }
@@ -695,7 +797,17 @@ pub(crate) fn hline(
 
 /// Fill a rect by alpha-blending `color` over what's already in `buf` (clipped).
 /// Used for the translucent scrollbar so the backdrop reads through it.
-pub(crate) fn blend_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usize, w: usize, h: usize, color: u32, a: u32) {
+pub(crate) fn blend_rect(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    color: u32,
+    a: u32,
+) {
     for yy in y..(y + h).min(ph) {
         for xx in x..(x + w).min(pw) {
             let idx = yy * pw + xx;
@@ -709,13 +821,24 @@ pub(crate) fn blend_rect(buf: &mut [u32], pw: usize, ph: usize, x: usize, y: usi
 /// `screen` lines. Single source of truth for [`draw_scrollbar`] and the
 /// drag/click hit-testing in `lib.rs`, so the picture and the grab can't
 /// disagree. With no scrollback the thumb fills the whole track.
-pub(crate) fn scrollbar_thumb(area_y: usize, area_h: usize, offset: usize, history: usize, screen: usize, min_thumb: usize) -> (usize, usize) {
+pub(crate) fn scrollbar_thumb(
+    area_y: usize,
+    area_h: usize,
+    offset: usize,
+    history: usize,
+    screen: usize,
+    min_thumb: usize,
+) -> (usize, usize) {
     let total = (history + screen).max(1);
     let thumb_h = (area_h * screen / total).max(min_thumb).min(area_h);
     let span = area_h - thumb_h;
     // `offset == history` is the top (fully scrolled back), `offset == 0` the
     // bottom (live tail).
-    let top = if history == 0 { area_y } else { area_y + span * (history - offset) / history };
+    let top = if history == 0 {
+        area_y
+    } else {
+        area_y + span * (history - offset) / history
+    };
     (top, thumb_h)
 }
 
@@ -746,21 +869,34 @@ pub(crate) fn draw_scrollbar(
     let (top, thumb_h) = scrollbar_thumb(y, h, offset, history, screen, min_thumb);
     // Dim and full-height when there's nothing to scroll; brighter when there
     // is, brightest while dragging.
-    let a = if history == 0 { 28 } else if active { 150 } else { 92 };
+    let a = if history == 0 {
+        28
+    } else if active {
+        150
+    } else {
+        92
+    };
     blend_rect(buf, bw, bh, x, top, w, thumb_h, 0xff_ff_ff, a);
 }
 
 /// The left tree pane, rendered as plain monospace text on the terminal's own
 /// cell grid: one row per visible node at the terminal line height, indented by
 /// depth with no markers, and a filled background for the selected row.
+pub(crate) struct SidebarView<'a> {
+    pub(crate) rows: &'a [Row],
+    pub(crate) primary: NodeId,
+    pub(crate) selection: &'a HashSet<NodeId>,
+    pub(crate) renaming: Option<NodeId>,
+    pub(crate) hovered: Option<NodeId>,
+    pub(crate) drop: Option<DropPreview>,
+}
+
 pub(crate) fn draw_sidebar(
     buf: &mut [u32],
     pw: usize,
     ph: usize,
     r: &mut Renderer,
-    rows: &[Row],
-    selected: NodeId,
-    hovered: Option<NodeId>,
+    view: &SidebarView<'_>,
     sidebar_w: usize,
     scroll: usize,
 ) {
@@ -780,8 +916,8 @@ pub(crate) fn draw_sidebar(
     // Selection is a filled background, exactly how the terminal highlights its
     // own selected cells.
     let rh = r.cell_h;
-    let tops = sidebar_row_tops(rows, rh);
-    for (i, row) in rows.iter().enumerate() {
+    let tops = sidebar_row_tops(view.rows, rh);
+    for (i, row) in view.rows.iter().enumerate() {
         // Rows scrolled up past the top of the list are skipped; `scroll` is a
         // multiple of `rh` so the survivors stay flush under the header.
         if tops[i] < scroll {
@@ -791,12 +927,12 @@ pub(crate) fn draw_sidebar(
         if y + rh > ph {
             break;
         }
-        let is_sel = row.id == selected;
+        let is_sel = row.id == view.primary || view.selection.contains(&row.id);
         if is_sel {
             // The selection band still spans the full pane; only the label text
             // is inset, so the highlight stays edge-to-edge.
             fill_rect(buf, pw, ph, 0, y, sidebar_w - 1, rh, SEL);
-        } else if hovered == Some(row.id) {
+        } else if view.hovered == Some(row.id) {
             // A faint lightening of the unselected row under the pointer — just
             // enough to read as "this is the target", not enough to compete with
             // the selection band. Same edge-to-edge span as the selection fill.
@@ -806,7 +942,16 @@ pub(crate) fn draw_sidebar(
         // (sections, and the standalone "Edit Config" session) full-ink, nested
         // sessions dim. Labels carry a small left inset (`SIDEBAR_PAD_L`) so the
         // text doesn't sit flush against the pane edge.
-        let color = if is_sel || row.depth == 0 { INK } else { INK_DIM };
+        let color = if is_sel || row.is_group { INK } else { INK_DIM };
+        let display_label;
+        let label = if view.renaming == Some(row.id) {
+            display_label = format!("{}_", row.name);
+            &display_label
+        } else if row.is_group && row.name.is_empty() {
+            "(untitled)"
+        } else {
+            &row.name
+        };
         draw_text(
             buf,
             pw,
@@ -815,23 +960,60 @@ pub(crate) fn draw_sidebar(
             SIDEBAR_PAD_L,
             y,
             sidebar_w.saturating_sub(SIDEBAR_PAD_L),
-            &row.name,
+            label,
             color,
         );
     }
+    if let Some(drop) = view.drop {
+        if let Placement::Into(target) = drop.placement {
+            if let Some(i) = view.rows.iter().position(|row| row.id == target) {
+                if tops[i] >= scroll {
+                    let y = HEADER_H + tops[i] - scroll;
+                    stroke_rect(buf, pw, ph, 1, y, sidebar_w.saturating_sub(2), rh, LINK);
+                }
+            }
+        } else {
+            let y = match drop.placement {
+                Placement::Before(target) | Placement::After(target) => view
+                    .rows
+                    .iter()
+                    .position(|row| row.id == target)
+                    .map(|index| {
+                        HEADER_H + tops[index] - scroll
+                            + usize::from(matches!(drop.placement, Placement::After(_))) * rh
+                    })
+                    .unwrap_or(HEADER_H),
+                Placement::End => tops
+                    .last()
+                    .map(|top| HEADER_H + top + rh - scroll)
+                    .unwrap_or(HEADER_H),
+                Placement::Into(_) => unreachable!(),
+            };
+            if y < ph {
+                fill_rect(
+                    buf,
+                    pw,
+                    ph,
+                    1,
+                    y.saturating_sub(1),
+                    sidebar_w.saturating_sub(2),
+                    2,
+                    LINK,
+                );
+            }
+        }
+    }
 }
 
-/// Top y of each sidebar row, relative to `HEADER_H`. A one-row blank spacer
-/// precedes every top-level row except the first, so sections (and the
-/// standalone "Edit Config" session) read as separated blocks. Shared by
-/// [`draw_sidebar`] and `sidebar_hit` so the picture on screen and the click map
-/// can never disagree.
+/// Top y of each sidebar row, relative to `HEADER_H`. Exactly one blank row
+/// precedes each group after the first block. Loose sessions never introduce
+/// another spacer after the final group.
 pub(crate) fn sidebar_row_tops(rows: &[Row], rh: usize) -> Vec<usize> {
     let mut tops = Vec::with_capacity(rows.len());
     let mut y = 0;
     for (i, row) in rows.iter().enumerate() {
-        if i > 0 && row.depth == 0 {
-            y += rh; // blank line between top-level blocks
+        if i > 0 && row.is_group {
+            y += rh;
         }
         tops.push(y);
         y += rh;
@@ -839,9 +1021,39 @@ pub(crate) fn sidebar_row_tops(rows: &[Row], rh: usize) -> Vec<usize> {
     tops
 }
 
-/// A small bevelled popup at the cursor, one row per item (e.g. Start/Stop,
-/// Copy/Paste/Search, or Open/Copy/Paste). `hovered` is the item the pointer is
-/// currently over, drawn with a highlight bar so it behaves like a normal menu.
+/// Pure pointer-to-model projection for a sidebar drag. The middle half of a
+/// group row means `Into`; its edges mean adjacency. A blank spacer maps to the
+/// boundary before the next group and remains non-selectable for normal clicks.
+pub(crate) fn sidebar_drop_placement(rows: &[Row], rh: usize, offset: usize) -> Placement {
+    let rh = rh.max(1);
+    let tops = sidebar_row_tops(rows, rh);
+    tops.iter()
+        .enumerate()
+        .rfind(|(_, top)| offset >= **top)
+        .and_then(|(index, &top)| (offset < top + rh).then_some((index, top)))
+        .map(|(index, top)| {
+            let row = &rows[index];
+            let within = offset - top;
+            if row.is_group && within >= rh / 4 && within < rh * 3 / 4 {
+                Placement::Into(row.id)
+            } else if within < rh / 2 {
+                Placement::Before(row.id)
+            } else {
+                Placement::After(row.id)
+            }
+        })
+        .or_else(|| {
+            tops.iter()
+                .position(|&top| top > offset)
+                .map(|index| Placement::Before(rows[index].id))
+        })
+        .unwrap_or(Placement::End)
+}
+
+/// A small bevelled popup at the cursor, one row per item (e.g. Start/Stop/Close,
+/// or Copy/Paste/Search/Submit). `hovered` is the item the pointer is currently
+/// over, drawn with a highlight bar so it behaves like a normal menu. `seps`
+/// holds the item indices *after* which a divider line separates groups.
 pub(crate) fn draw_ctx_menu(
     buf: &mut [u32],
     pw: usize,
@@ -850,26 +1062,47 @@ pub(crate) fn draw_ctx_menu(
     x: usize,
     y: usize,
     items: &[&str],
+    enabled: &[bool],
+    seps: &[usize],
     hovered: Option<usize>,
 ) {
     let n = items.len().max(1);
-    let h = ROW_H * n + 2;
+    let h = ctx_menu_height(n, seps.len());
     vgradient(buf, pw, ph, x, y, CTX_W, h, PANEL_HI, PANEL_LO);
     stroke_rect(buf, pw, ph, x, y, CTX_W, h, BEVEL_DK);
     fill_rect(buf, pw, ph, x, y, CTX_W, 1, BEVEL_LT);
     fill_rect(buf, pw, ph, x, y, 1, h, BEVEL_LT);
     let ty = ROW_H.saturating_sub(r.cell_h) / 2;
     for (i, label) in items.iter().enumerate() {
-        let ry = y + 1 + i * ROW_H;
-        if hovered == Some(i) {
+        let gaps_before = seps.iter().filter(|&&sep| sep < i).count();
+        let ry = y + 1 + i * ROW_H + gaps_before * CTX_SEP_H;
+        let on = enabled.get(i).copied().unwrap_or(true);
+        if on && hovered == Some(i) {
             fill_rect(buf, pw, ph, x + 1, ry, CTX_W - 2, ROW_H, SEL);
         }
-        draw_text(buf, pw, ph, r, x + 10, ry + ty, CTX_W - 12, label, INK);
+        draw_text(
+            buf,
+            pw,
+            ph,
+            r,
+            x + 10,
+            ry + ty,
+            CTX_W - 12,
+            label,
+            if on { INK } else { INK_DIM },
+        );
     }
-    // Dividers between items (drawn after, so the hover bar sits under them).
-    for i in 1..items.len() {
-        fill_rect(buf, pw, ph, x + 4, y + i * ROW_H, CTX_W - 8, 1, BEVEL_DK);
+    // A divider gets its own breathing room rather than being painted on a row
+    // boundary. The inset two-tone rule matches the surrounding bevel.
+    for (gap, &i) in seps.iter().filter(|&&i| i + 1 < items.len()).enumerate() {
+        let sy = y + 1 + (i + 1) * ROW_H + gap * CTX_SEP_H + CTX_SEP_H / 2;
+        fill_rect(buf, pw, ph, x + 9, sy, CTX_W - 18, 1, BEVEL_DK);
+        fill_rect(buf, pw, ph, x + 9, sy + 1, CTX_W - 18, 1, BEVEL_LT);
     }
+}
+
+fn ctx_menu_height(item_count: usize, sep_count: usize) -> usize {
+    ROW_H * item_count.max(1) + CTX_SEP_H * sep_count + 2
 }
 
 /// Which context-menu item (if any) the point falls on, or `None` when outside
@@ -877,15 +1110,38 @@ pub(crate) fn draw_ctx_menu(
 pub(crate) fn ctx_item_at(m: &CtxMenu, x: f64, y: f64) -> Option<usize> {
     let n = m.items.len().max(1);
     let (mx, my) = (m.x as f64, m.y as f64);
-    let h = (ROW_H * n + 2) as f64;
+    let seps = m.seps();
+    let h = ctx_menu_height(n, seps.len()) as f64;
     if x < mx || x >= mx + CTX_W as f64 || y < my || y >= my + h {
         return None;
     }
-    Some((((y - my) / ROW_H as f64) as usize).min(n - 1))
+    let local_y = y - my - 1.0;
+    for i in 0..n {
+        let gaps_before = seps.iter().filter(|&&sep| sep < i).count();
+        let top = (i * ROW_H + gaps_before * CTX_SEP_H) as f64;
+        if local_y >= top && local_y < top + ROW_H as f64 {
+            return Some(i);
+        }
+    }
+    None
 }
 
-/// A Win2k push-button: raised by default, sunken+inset when `pressed`, dim
-/// when `!enabled`. Used for the window controls and the use-cwd action.
+/// Keep a context menu wholly inside the window, moving it upward when it was
+/// opened too close to the bottom edge.
+pub(crate) fn ctx_menu_y(
+    pointer_y: usize,
+    ph: usize,
+    item_count: usize,
+    sep_count: usize,
+) -> usize {
+    let h = ctx_menu_height(item_count, sep_count);
+    pointer_y.min(ph.saturating_sub(h))
+}
+
+/// A Win2k push-button: raised by default, sunken+inset when `pressed`, a
+/// brighter gradient when `hovered` (pointer over it, not pressed), dim when
+/// `!enabled`. Used for the window controls, the use-cwd action, and the
+/// licensing modals.
 pub(crate) fn draw_button(
     buf: &mut [u32],
     pw: usize,
@@ -894,6 +1150,7 @@ pub(crate) fn draw_button(
     rect: Rect,
     label: &str,
     pressed: bool,
+    hovered: bool,
     enabled: bool,
 ) {
     let (x, y, w, h) = rect;
@@ -904,7 +1161,13 @@ pub(crate) fn draw_button(
         fill_rect(buf, pw, ph, x, y + h - 1, w, 1, BEVEL_LT);
         fill_rect(buf, pw, ph, x + w - 1, y, 1, h, BEVEL_LT);
     } else {
-        vgradient(buf, pw, ph, x, y, w, h, PANEL_HI, PANEL_LO);
+        // Lift the gradient a notch on hover so the button reacts to the pointer.
+        let (hi, lo) = if hovered && enabled {
+            (BTN_HOVER_HI, BTN_HOVER_LO)
+        } else {
+            (PANEL_HI, PANEL_LO)
+        };
+        vgradient(buf, pw, ph, x, y, w, h, hi, lo);
         stroke_rect(buf, pw, ph, x, y, w, h, BEVEL_DK);
         fill_rect(buf, pw, ph, x, y, w, 1, BEVEL_LT);
         fill_rect(buf, pw, ph, x, y, 1, h, BEVEL_LT);
@@ -913,7 +1176,17 @@ pub(crate) fn draw_button(
     let off = pressed as usize;
     let tx = x + w.saturating_sub(tw) / 2 + off;
     let ty = y + h.saturating_sub(r.cell_h) / 2 + off;
-    draw_text(buf, pw, ph, r, tx, ty, w, label, if enabled { INK } else { INK_DIM });
+    draw_text(
+        buf,
+        pw,
+        ph,
+        r,
+        tx,
+        ty,
+        w,
+        label,
+        if enabled { INK } else { INK_DIM },
+    );
 }
 
 /// A sunken Win2k text box. `focused` draws the caret; `enabled` is false for
@@ -976,7 +1249,17 @@ pub(crate) fn draw_inspector(
     fill_rect(buf, pw, ph, px, 0, RPANEL_W, 1, BEVEL_LT);
     fill_rect(buf, pw, ph, px, HEADER_H - 1, RPANEL_W, 1, BEVEL_DK);
     let hty = HEADER_H.saturating_sub(r.cell_h) / 2;
-    draw_text(buf, pw, ph, r, px + 10, hty, RPANEL_W - 20, "PROPERTIES", INK);
+    draw_text(
+        buf,
+        pw,
+        ph,
+        r,
+        px + 10,
+        hty,
+        RPANEL_W - 20,
+        "PROPERTIES",
+        INK,
+    );
     draw_text(
         buf,
         pw,
@@ -1020,6 +1303,7 @@ pub(crate) fn draw_inspector(
         usecwd_btn(pw, cell_h),
         "Use current working dir",
         false,
+        false,
         can_use_cwd,
     );
 }
@@ -1058,6 +1342,18 @@ pub(crate) fn scrollbar_rect(pw: usize, ph: usize, inspector: bool) -> Rect {
     let gx = term_right(pw, inspector).saturating_sub(SBAR_GUTTER);
     let x = gx + SBAR_GUTTER.saturating_sub(SBAR_W) / 2;
     (x, HEADER_H, SBAR_W, ph.saturating_sub(HEADER_H))
+}
+
+/// Full interactive gutter owned by the scrollbar. The painted track is
+/// narrower and centred inside this rect, but every pixel in the gutter must
+/// scroll rather than leak through to the borderless-window resize grips.
+pub(crate) fn scrollbar_gutter_rect(pw: usize, ph: usize, inspector: bool) -> Rect {
+    (
+        term_content_right(pw, inspector),
+        HEADER_H,
+        SBAR_GUTTER,
+        ph.saturating_sub(HEADER_H),
+    )
 }
 
 /// `[minimize, maximize, close]` traffic-light hit cells, full header height and
@@ -1105,23 +1401,30 @@ pub(crate) fn usecwd_btn(pw: usize, cell_h: usize) -> Rect {
 /// no resize at all** — it's the title bar (drag + window controls), so there's
 /// no North / NorthWest / NorthEast grip to fight dragging.
 ///
-/// The scrollbar's gutter lives on the window's right edge, so its thumb would
-/// otherwise be shadowed by the thin `East` grip and never clickable. Over the
-/// bar's track we suppress the `East` grip and let the scrollbar take the click;
-/// the bottom corners still resize, so the diagonal handles are unaffected.
-pub(crate) fn resize_dir(pw: usize, ph: usize, inspector: bool, x: f64, y: f64) -> Option<ResizeDirection> {
+/// The scrollbar's gutter lives on the window's right edge when the inspector
+/// is closed. Its full gutter takes precedence over every resize grip,
+/// including the enlarged bottom-right corner.
+pub(crate) fn resize_dir(
+    pw: usize,
+    ph: usize,
+    inspector: bool,
+    x: f64,
+    y: f64,
+) -> Option<ResizeDirection> {
+    if hit(scrollbar_gutter_rect(pw, ph, inspector), x, y) {
+        return None;
+    }
     let (w, h) = (pw as f64, ph as f64);
     let (l, r, b) = (x < EDGE, x >= w - EDGE, y >= h - EDGE);
     // Enlarged squares at the two bottom corners only.
     let (cl, cr) = (x < CORNER, x >= w - CORNER);
     let cb = y >= h - CORNER;
-    let on_sbar = hit(scrollbar_rect(pw, ph, inspector), x, y);
     Some(match () {
         _ if cb && cl => ResizeDirection::SouthWest,
         _ if cb && cr => ResizeDirection::SouthEast,
         _ if b => ResizeDirection::South,
         _ if l => ResizeDirection::West,
-        _ if r && !on_sbar => ResizeDirection::East,
+        _ if r => ResizeDirection::East,
         _ => return None,
     })
 }
@@ -1185,3 +1488,202 @@ pub(crate) fn blend(fg: u32, bg: u32, a: u32) -> u32 {
     mix(16) << 16 | mix(8) << 8 | mix(0)
 }
 
+// --- licensing modals ------------------------------------------------------
+// A centred, blocking dialog (the unregistered nag, or the key-entry box). One
+// source of truth for each layout, shared by the draw and the click hit-test in
+// `lib.rs` — the same discipline as the chrome geometry above. Only reachable
+// under the `licensing` feature.
+
+#[cfg(feature = "licensing")]
+pub(crate) const MODAL_W: usize = 400;
+#[cfg(feature = "licensing")]
+const MODAL_PAD: usize = 16;
+#[cfg(feature = "licensing")]
+const MODAL_BTN_H: usize = 26;
+
+/// Centre a panel of height `h` in the window.
+#[cfg(feature = "licensing")]
+fn modal_panel(pw: usize, ph: usize, h: usize) -> Rect {
+    let w = MODAL_W.min(pw);
+    (pw.saturating_sub(w) / 2, ph.saturating_sub(h) / 2, w, h)
+}
+
+/// Nag dialog: the panel plus its three buttons `[Buy License, Enter Key,
+/// Continue]`, laid out as an equal-width row along the bottom.
+#[cfg(feature = "licensing")]
+pub(crate) fn nag_layout(pw: usize, ph: usize) -> (Rect, [Rect; 3]) {
+    let panel = modal_panel(pw, ph, 148);
+    let (x, y, w, h) = panel;
+    let by = y + h - MODAL_PAD - MODAL_BTN_H;
+    let bw = (w - MODAL_PAD * 4) / 3;
+    let btn = |i: usize| (x + MODAL_PAD + i * (bw + MODAL_PAD), by, bw, MODAL_BTN_H);
+    (panel, [btn(0), btn(1), btn(2)])
+}
+
+/// Key-entry dialog: the panel, the text field, and the `[Verify, Cancel]`
+/// buttons (Cancel left of Verify, both bottom-right).
+#[cfg(feature = "licensing")]
+pub(crate) fn enterkey_layout(pw: usize, ph: usize) -> (Rect, Rect, Rect, Rect) {
+    let panel = modal_panel(pw, ph, 170);
+    let (x, y, w, h) = panel;
+    let field = (x + MODAL_PAD, y + 66, w - MODAL_PAD * 2, 26);
+    let bw = 92;
+    let by = y + h - MODAL_PAD - MODAL_BTN_H;
+    let verify = (x + w - MODAL_PAD - bw, by, bw, MODAL_BTN_H);
+    let cancel = (x + w - MODAL_PAD * 2 - bw * 2, by, bw, MODAL_BTN_H);
+    (panel, field, verify, cancel)
+}
+
+/// Dim the whole frame and draw a raised Win2k panel with a title bar. Shared
+/// chrome for both modals; returns the panel rect.
+#[cfg(feature = "licensing")]
+fn modal_frame(buf: &mut [u32], pw: usize, ph: usize, r: &mut Renderer, panel: Rect, title: &str) {
+    blend_rect(buf, pw, ph, 0, 0, pw, ph, 0x00_00_00, 150); // scrim
+    let (x, y, w, h) = panel;
+    vgradient(buf, pw, ph, x, y, w, h, PANEL_HI, PANEL_LO);
+    stroke_rect(buf, pw, ph, x, y, w, h, BEVEL_DK);
+    fill_rect(buf, pw, ph, x, y, w, 1, BEVEL_LT);
+    fill_rect(buf, pw, ph, x, y, 1, h, BEVEL_LT);
+    // Title strip.
+    vgradient(buf, pw, ph, x + 1, y + 1, w - 2, HEADER_H, HEAD_HI, HEAD_LO);
+    fill_rect(buf, pw, ph, x + 1, y + HEADER_H, w - 2, 1, BEVEL_DK);
+    let ty = 1 + HEADER_H.saturating_sub(r.cell_h) / 2;
+    draw_text(
+        buf,
+        pw,
+        ph,
+        r,
+        x + MODAL_PAD,
+        y + ty,
+        w - MODAL_PAD * 2,
+        title,
+        INK,
+    );
+}
+
+/// Draw a run of body lines starting below the title bar.
+#[cfg(feature = "licensing")]
+fn modal_body(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    r: &mut Renderer,
+    panel: Rect,
+    lines: &[&str],
+) {
+    let (x, y, w, _) = panel;
+    let mut ly = y + HEADER_H + MODAL_PAD;
+    for line in lines {
+        draw_text(
+            buf,
+            pw,
+            ph,
+            r,
+            x + MODAL_PAD,
+            ly,
+            w - MODAL_PAD * 2,
+            line,
+            INK_DIM,
+        );
+        ly += r.cell_h + 5;
+    }
+}
+
+/// The unregistered-copy reminder. `hover`/`press` are the button indices the
+/// pointer is over / holding down (0=Buy, 1=Enter Key, 2=Continue).
+#[cfg(feature = "licensing")]
+pub(crate) fn draw_nag(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    r: &mut Renderer,
+    hover: Option<usize>,
+    press: Option<usize>,
+) {
+    let (panel, btns) = nag_layout(pw, ph);
+    modal_frame(buf, pw, ph, r, panel, "termset \u{2014} unregistered");
+    modal_body(
+        buf,
+        pw,
+        ph,
+        r,
+        panel,
+        &[
+            "This is an unregistered copy of termset.",
+            "A license is a one-time $25. It removes this",
+            "reminder and supports development.",
+        ],
+    );
+    for (i, (rect, label)) in btns
+        .iter()
+        .zip(["Buy License", "Enter Key", "Continue"])
+        .enumerate()
+    {
+        // Sunken only while the pointer is still over the button it pressed.
+        let down = press == Some(i) && hover == Some(i);
+        draw_button(buf, pw, ph, r, *rect, label, down, hover == Some(i), true);
+    }
+}
+
+/// The license-key entry dialog. `input` is the current buffer; `error` draws a
+/// red-ish "key was not valid" hint under the field.
+/// The license-key entry dialog. `hover`/`press` are button indices the pointer
+/// is over / holding (0=Verify, 1=Cancel).
+#[cfg(feature = "licensing")]
+pub(crate) fn draw_enterkey(
+    buf: &mut [u32],
+    pw: usize,
+    ph: usize,
+    r: &mut Renderer,
+    input: &str,
+    error: bool,
+    hover: Option<usize>,
+    press: Option<usize>,
+) {
+    let (panel, field, verify, cancel) = enterkey_layout(pw, ph);
+    modal_frame(buf, pw, ph, r, panel, "Enter License Key");
+    let hint: &str = if error {
+        "That key wasn't valid \u{2014} paste the whole key."
+    } else {
+        "Paste the license key from your purchase email."
+    };
+    modal_body(buf, pw, ph, r, panel, &[hint]);
+
+    // License keys are long; show the tail that fits so the caret stays visible.
+    let (fx, _, fw, _) = field;
+    let fit = (fw.saturating_sub(12) / r.cell_w.max(1)).max(1);
+    let chars: Vec<char> = input.chars().collect();
+    let shown: String = chars[chars.len().saturating_sub(fit)..].iter().collect();
+    let caret = shown.chars().count();
+    draw_field(buf, pw, ph, r, field, &shown, true, caret, true);
+    let _ = fx;
+
+    if error {
+        // Tint the field border so the failure reads at a glance.
+        let (x, y, w, h) = field;
+        stroke_rect(buf, pw, ph, x, y, w, h, 0xc0_40_40);
+    }
+    let down = |i: usize| press == Some(i) && hover == Some(i);
+    draw_button(
+        buf,
+        pw,
+        ph,
+        r,
+        verify,
+        "Verify",
+        down(0),
+        hover == Some(0),
+        true,
+    );
+    draw_button(
+        buf,
+        pw,
+        ph,
+        r,
+        cancel,
+        "Cancel",
+        down(1),
+        hover == Some(1),
+        true,
+    );
+}
