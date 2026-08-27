@@ -137,6 +137,65 @@ impl Tree {
         rows
     }
 
+    /// Visible row adjacent to `current`, wrapping at the ends, without
+    /// allocating the render rows or cloning their labels.
+    pub(crate) fn visible_neighbor(
+        &self,
+        current: NodeId,
+        reveal: NodeId,
+        forward: bool,
+    ) -> Option<NodeId> {
+        struct Walk {
+            first: Option<NodeId>,
+            last: Option<NodeId>,
+            previous: Option<NodeId>,
+            found_current: bool,
+            next: Option<NodeId>,
+            saw_current: bool,
+        }
+
+        fn visit(tree: &Tree, id: NodeId, reveal: NodeId, current: NodeId, walk: &mut Walk) {
+            for &child in &tree.nodes[id].children {
+                let node = &tree.nodes[child];
+                if node.volatile && child != reveal {
+                    continue;
+                }
+                walk.first.get_or_insert(child);
+                if walk.found_current && walk.next.is_none() {
+                    walk.next = Some(child);
+                }
+                if child == current {
+                    walk.saw_current = true;
+                    walk.found_current = true;
+                } else if !walk.found_current {
+                    walk.previous = Some(child);
+                }
+                walk.last = Some(child);
+                if matches!(node.kind, Kind::Group) && node.expanded {
+                    visit(tree, child, reveal, current, walk);
+                }
+            }
+        }
+
+        let mut walk = Walk {
+            first: None,
+            last: None,
+            previous: None,
+            found_current: false,
+            next: None,
+            saw_current: false,
+        };
+        visit(self, self.root, reveal, current, &mut walk);
+        if !walk.saw_current {
+            return walk.first;
+        }
+        if forward {
+            walk.next.or(walk.first)
+        } else {
+            walk.previous.or(walk.last)
+        }
+    }
+
     pub(crate) fn leaves(&self, id: NodeId) -> Vec<NodeId> {
         fn visit(tree: &Tree, id: NodeId, leaves: &mut Vec<NodeId>) {
             if tree.is_leaf(id) {
@@ -162,6 +221,24 @@ impl Tree {
 
     pub(crate) fn first_leaf(&self, id: NodeId) -> Option<NodeId> {
         self.leaves(id).into_iter().next()
+    }
+
+    /// First leaf in DFS order matching `predicate`, without materializing the
+    /// subtree. Used on every repaint when a group is selected.
+    pub(crate) fn first_leaf_matching(
+        &self,
+        id: NodeId,
+        predicate: &dyn Fn(NodeId) -> bool,
+    ) -> Option<NodeId> {
+        if self.is_leaf(id) {
+            return predicate(id).then_some(id);
+        }
+        for &child in &self.nodes[id].children {
+            if let Some(found) = self.first_leaf_matching(child, predicate) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     pub(crate) fn prev_sibling(&self, id: NodeId) -> Option<NodeId> {

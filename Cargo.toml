@@ -36,3 +36,17 @@ x11rb = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Keep the softbuffer CALayer backed by the theme colour while macOS is
+# exposing pixels ahead of the next resize frame.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-graphics = { version = "0.3", features = ["std", "CGColor", "CGColorSpace"] }
+objc2-quartz-core = { version = "0.3", features = ["std", "CALayer", "objc2-core-graphics"] }
+raw-window-handle = "0.6"
+
+[profile.dev]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3

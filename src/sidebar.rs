@@ -216,15 +216,22 @@ impl State {
     }
 
     fn select_relative(&mut self, tree: &Tree, delta: i32) -> bool {
-        let rows = self.rows(tree);
-        if rows.is_empty() {
+        let steps = delta.unsigned_abs();
+        if steps == 0 {
             return false;
         }
-        let next = match rows.iter().position(|row| row.id == self.primary) {
-            Some(index) => (index as i32 + delta).rem_euclid(rows.len() as i32) as usize,
-            None => 0,
-        };
-        self.select_only(rows[next].id);
+        let forward = delta > 0;
+        let mut next = self.primary;
+        for _ in 0..steps {
+            let Some(node) = tree.visible_neighbor(next, self.primary, forward) else {
+                return false;
+            };
+            next = node;
+        }
+        if next == self.primary {
+            return false;
+        }
+        self.select_only(next);
         true
     }
 

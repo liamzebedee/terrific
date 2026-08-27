@@ -50,6 +50,10 @@ impl Harness {
         let state = State {
             window: None,
             fb: Vec::new(),
+            redraw_pending: std::cell::Cell::new(false),
+            upscale_cols: Vec::new(),
+            upscale_cols_key: (0, 0, 0),
+            skip_logical_terminal: false,
             phys: (w, h),
             scale,
             renderer: Renderer::new(),
